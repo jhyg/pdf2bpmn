@@ -130,6 +130,7 @@ class Role(BaseEntity):
 class Gateway(BaseEntity):
     gateway_id: str = Field(default_factory=generate_id)
     process_id: str = ""
+    name: str = ""
     gateway_type: GatewayType = GatewayType.EXCLUSIVE
     condition: str = ""
     description: str = ""

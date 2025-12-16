@@ -604,7 +604,11 @@ class EntityExtractor:
         # Create sequence flows for tasks without explicit flows
         existing_flows = set()
         for flow in entities["sequence_flows"]:
-            existing_flows.add((flow["from_task_id"], flow["to_task_id"]))
+            # Handle both formats: from_task_id/to_task_id or from_id/to_id
+            from_id = flow.get("from_task_id") or flow.get("from_id")
+            to_id = flow.get("to_task_id") or flow.get("to_id")
+            if from_id and to_id:
+                existing_flows.add((from_id, to_id))
         
         for proc_id, proc_tasks in tasks_by_process.items():
             # Sort by order

@@ -409,8 +409,8 @@ async def get_processes():
                 MATCH (p:Process)
                 OPTIONAL MATCH (p)-[:HAS_TASK]->(t:Task)
                 OPTIONAL MATCH (p)<-[:SUPPORTED_BY]-(c:ReferenceChunk)
-                RETURN p {.*, taskCount: count(DISTINCT t)} as process,
-                       collect(DISTINCT {page: c.page, text: c.text})[0] as evidence
+                WITH p, count(DISTINCT t) as taskCount, collect(DISTINCT {page: c.page, text: c.text})[0] as evidence
+                RETURN p {.*, taskCount: taskCount} as process, evidence
                 ORDER BY p.name
             """)
             processes = []
@@ -449,13 +449,11 @@ async def get_tasks():
                 OPTIONAL MATCH (t)-[:SUPPORTED_BY]->(c:ReferenceChunk)
                 OPTIONAL MATCH (t)-[:NEXT]->(next:Task)
                 OPTIONAL MATCH (prev:Task)-[:NEXT]->(t)
-                RETURN t {.*} as task,
-                       r.name as role_name,
-                       p.name as process_name,
-                       p.proc_id as process_id,
-                       collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence,
-                       collect(DISTINCT next.name) as next_tasks,
-                       collect(DISTINCT prev.name) as prev_tasks
+                WITH t, r.name as role_name, p.name as process_name, p.proc_id as process_id,
+                     collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence,
+                     collect(DISTINCT next.name) as next_tasks,
+                     collect(DISTINCT prev.name) as prev_tasks
+                RETURN t {.*} as task, role_name, process_name, process_id, evidence, next_tasks, prev_tasks
                 ORDER BY t.order
             """)
             tasks = []
@@ -603,8 +601,9 @@ async def get_roles():
                 OPTIONAL MATCH (t:Task)-[:PERFORMED_BY]->(r)
                 OPTIONAL MATCH (r)-[:MAKES_DECISION]->(d:DMNDecision)
                 OPTIONAL MATCH (r)-[:SUPPORTED_BY]->(c:ReferenceChunk)
-                RETURN r {.*, taskCount: count(DISTINCT t), decisionCount: count(DISTINCT d)} as role,
-                       collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence
+                WITH r, count(DISTINCT t) as taskCount, count(DISTINCT d) as decisionCount, 
+                     collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence
+                RETURN r {.*, taskCount: taskCount, decisionCount: decisionCount} as role, evidence
                 ORDER BY r.name
             """)
             roles = []
@@ -628,9 +627,9 @@ async def get_decisions():
                 OPTIONAL MATCH (d)-[:HAS_RULE]->(rule:DMNRule)
                 OPTIONAL MATCH (r:Role)-[:MAKES_DECISION]->(d)
                 OPTIONAL MATCH (d)-[:SUPPORTED_BY]->(c:ReferenceChunk)
-                RETURN d {.*, ruleCount: count(DISTINCT rule)} as decision,
-                       collect(DISTINCT r.name) as roles,
-                       collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence
+                WITH d, count(DISTINCT rule) as ruleCount, collect(DISTINCT r.name) as roles,
+                     collect(DISTINCT {page: c.page, text: left(c.text, 200)})[0] as evidence
+                RETURN d {.*, ruleCount: ruleCount} as decision, roles, evidence
                 ORDER BY d.name
             """)
             decisions = []
