@@ -37,19 +37,20 @@ Analyze the following text and extract:
 1. **Processes**: Business processes or procedures (절차, 업무 흐름, 처리 단계, 프로세스)
 2. **Tasks/Activities**: Individual activities or actions (행위: ~한다, ~해야 한다, 점검, 승인, 검토, 접수, 등록, 통보, 보고)
 3. **Roles**: Actors or performers (담당자, 승인권자, 검토자, 부서명, 직책, 시스템, 외부기관)
-4. **Gateways**: Decision points or conditions (~인 경우, 아닌 경우, 다만, 예외적으로, 필요 시)
+4. **Gateways**: Decision/branching POINTS only (분기점 - where flow splits or merges)
 5. **Events**: Start/End triggers (요청 접수 시, 신청서 제출 후, 정기적으로, 완료 시)
-6. **Decisions**: Business rules or decision logic (if-then rules, conditions)
+6. **Decisions**: Business rules or decision logic (if-then rules)
 7. **Rules**: Specific decision rules (조건-결과 pairs)
 
 IMPORTANT: Also extract RELATIONSHIPS between entities:
 8. **task_role_mappings**: Which role performs which task
 9. **task_process_mappings**: Which process contains which task
-10. **sequence_flows**: The order/sequence between tasks (VERY IMPORTANT!)
+10. **sequence_flows**: The order/sequence between tasks WITH CONDITIONS (VERY IMPORTANT!)
     - Identify which task comes BEFORE and AFTER another
-    - Look for sequential keywords: "다음", "이후", "후에", "그 다음", "완료 후", "then", "next", "after"
+    - **CONDITIONS GO HERE, NOT IN GATEWAYS**: "승인인 경우", "거부인 경우", "예산 부족 시", "금액 100만원 이상" etc.
+    - Look for conditional keywords: "~인 경우", "~면", "~시", "아니면", "그렇지 않으면"
+    - Look for sequential keywords: "다음", "이후", "후에", "그 다음", "완료 후"
     - Look for numbered steps: 1단계, 2단계, Step 1, Step 2
-    - If tasks appear in a numbered list, they are sequential
 
 For each entity, provide:
 - name: Clear, concise name
@@ -66,12 +67,13 @@ For tasks, also identify:
 - next_task: Name of the task that follows this one (if identifiable)
 - previous_task: Name of the task that precedes this one (if identifiable)
 
-For gateways:
-- gateway_type: "exclusive" (XOR), "parallel" (AND), "inclusive" (OR)
-- condition: The condition being evaluated
+For gateways (IMPORTANT: Gateway is just a BRANCHING POINT, NOT the condition itself):
+- gateway_type: "exclusive" (XOR - only one path taken), "parallel" (AND - all paths), "inclusive" (OR)
+- name: Descriptive name for the decision point (e.g., "승인 여부 분기", "예산 확인 분기", "금액 기준 분기")
+  DO NOT put condition text here - just the name of the decision point
 - parent_process: Name of the process this gateway belongs to
 - incoming_task: Name of the task before this gateway
-- outgoing_tasks: List of task names after this gateway with their conditions
+- description: Brief description of what decision is being made
 
 For decisions:
 - input_data: List of input data items
@@ -86,11 +88,27 @@ For task_process_mappings:
 - task_name: Name of the task
 - process_name: Name of the parent process
 
-For sequence_flows (IMPORTANT - extract the order of tasks!):
-- from_task: Name of the source task
+**For sequence_flows (CRITICAL - CONDITIONS ARE EXTRACTED HERE!):**
+- from_task: Name of the source task (or gateway name like "승인 여부 분기")
 - to_task: Name of the target task
-- condition: Condition for this flow (if any, e.g., "승인인 경우", "거부인 경우")
+- condition: **THE CONDITION FOR THIS SPECIFIC PATH** (VERY IMPORTANT!)
+  Examples:
+    - "승인인 경우" (when approved)
+    - "거부인 경우" (when rejected)
+    - "예산 충분" (budget sufficient)
+    - "예산 부족" (budget insufficient)
+    - "금액 100만원 이상" (amount >= 1M)
+    - "금액 100만원 미만" (amount < 1M)
+  Leave empty ("") for default/unconditional flows
 - process_name: Name of the process this flow belongs to
+
+Example of correct extraction:
+If text says: "승인권자가 승인하면 발주 처리를 진행하고, 거부하면 구매요청자에게 반려 통보한다"
+Extract:
+- Gateway: name="승인 여부 분기", gateway_type="exclusive"
+- sequence_flows:
+  1. from_task="승인 여부 분기", to_task="발주 처리", condition="승인인 경우"
+  2. from_task="승인 여부 분기", to_task="반려 통보", condition="거부인 경우"
 
 TEXT TO ANALYZE:
 {text}
@@ -500,29 +518,66 @@ class EntityExtractor:
             if chunk_id:
                 entities["entity_chunk_map"][rule_id] = chunk_id
         
-        # Process sequence flows from extracted data
+        # Build gateway name -> id mapping
+        gateway_name_to_id = {}
+        for gw in entities["gateways"]:
+            gateway_name_to_id[gw.name.lower()] = gw.gateway_id
+        
+        # Process sequence flows from extracted data (Task->Task, Task->Gateway, Gateway->Task)
         for flow in extracted.sequence_flows:
-            from_task_name = (flow.get("from_task") or "").lower()
-            to_task_name = (flow.get("to_task") or "").lower()
-            condition = flow.get("condition", "")
+            from_name = (flow.get("from_task") or "").lower()
+            to_name = (flow.get("to_task") or "").lower()
+            condition = flow.get("condition", "") or ""
             
-            from_task_id = None
-            to_task_id = None
+            from_id = None
+            from_type = None
+            to_id = None
+            to_type = None
             
-            # Find task IDs by name
+            # Find source: check tasks first, then gateways
             for task in entities["tasks"]:
                 task_lower = task.name.lower()
-                if from_task_name and (task_lower == from_task_name or from_task_name in task_lower):
-                    from_task_id = task.task_id
-                if to_task_name and (task_lower == to_task_name or to_task_name in task_lower):
-                    to_task_id = task.task_id
+                if from_name and (task_lower == from_name or from_name in task_lower or task_lower in from_name):
+                    from_id = task.task_id
+                    from_type = "task"
+                    break
             
-            if from_task_id and to_task_id:
+            if not from_id:
+                # Check gateways
+                for gw_name, gw_id in gateway_name_to_id.items():
+                    if from_name and (gw_name == from_name or from_name in gw_name or gw_name in from_name):
+                        from_id = gw_id
+                        from_type = "gateway"
+                        break
+            
+            # Find target: check tasks first, then gateways
+            for task in entities["tasks"]:
+                task_lower = task.name.lower()
+                if to_name and (task_lower == to_name or to_name in task_lower or task_lower in to_name):
+                    to_id = task.task_id
+                    to_type = "task"
+                    break
+            
+            if not to_id:
+                # Check gateways
+                for gw_name, gw_id in gateway_name_to_id.items():
+                    if to_name and (gw_name == to_name or to_name in gw_name or gw_name in to_name):
+                        to_id = gw_id
+                        to_type = "gateway"
+                        break
+            
+            if from_id and to_id:
                 entities["sequence_flows"].append({
-                    "from_task_id": from_task_id,
-                    "to_task_id": to_task_id,
-                    "condition": condition
+                    "from_id": from_id,
+                    "from_type": from_type,
+                    "to_id": to_id,
+                    "to_type": to_type,
+                    "condition": condition.strip() if condition else ""
                 })
+                
+                # Log for debugging
+                if condition:
+                    print(f"   📍 Sequence flow with condition: {from_name} → {to_name} [{condition}]")
         
         # Also create sequence flows from next_task/previous_task attributes
         for task in entities["tasks"]:

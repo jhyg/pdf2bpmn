@@ -549,24 +549,38 @@ class Neo4jClient:
             })
     
     def link_gateway_to_task(self, gateway_id: str, task_id: str, condition: str = None, is_incoming: bool = False):
-        """Create flow relationship between Gateway and Task."""
+        """Create flow relationship from Gateway to Task (outgoing from gateway)."""
         if is_incoming:
-            query = """
-            MATCH (t:Task {task_id: $task_id})
-            MATCH (g:Gateway {gateway_id: $gateway_id})
-            MERGE (t)-[r:NEXT]->(g)
-            """
-        else:
-            query = """
-            MATCH (g:Gateway {gateway_id: $gateway_id})
-            MATCH (t:Task {task_id: $task_id})
-            MERGE (g)-[r:NEXT {condition: $condition}]->(t)
-            """
+            # Legacy support - use link_task_to_gateway instead
+            self.link_task_to_gateway(task_id, gateway_id)
+            return
+        
+        query = """
+        MATCH (g:Gateway {gateway_id: $gateway_id})
+        MATCH (t:Task {task_id: $task_id})
+        MERGE (g)-[r:NEXT]->(t)
+        SET r.condition = $condition
+        """
         with self.session() as session:
             session.run(query, {
                 "gateway_id": gateway_id,
                 "task_id": task_id,
-                "condition": condition
+                "condition": condition or ""
+            })
+    
+    def link_task_to_gateway(self, task_id: str, gateway_id: str, condition: str = None):
+        """Create flow relationship from Task to Gateway (incoming to gateway)."""
+        query = """
+        MATCH (t:Task {task_id: $task_id})
+        MATCH (g:Gateway {gateway_id: $gateway_id})
+        MERGE (t)-[r:NEXT]->(g)
+        SET r.condition = $condition
+        """
+        with self.session() as session:
+            session.run(query, {
+                "task_id": task_id,
+                "gateway_id": gateway_id,
+                "condition": condition or ""
             })
     
     def link_event_to_task(self, event_id: str, task_id: str, is_start: bool = True):

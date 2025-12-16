@@ -37,7 +37,8 @@ class PDF2BPMNWorkflow:
         self.role_decision_map = {}  # role_id -> [decision_ids]
         self.entity_chunk_map = {}  # entity_id -> chunk_id
         self.role_skill_map = {}  # role_id -> [skill_ids]
-        self.sequence_flows = []  # list of {from_task_id, to_task_id, condition}
+        self.sequence_flows = []  # list of {from_id, to_id, from_type, to_type, condition}
+        self.all_gateways = []  # list of Gateway objects
         
         # Name -> ID mappings for lookup
         self.process_name_to_id = {}
@@ -408,7 +409,10 @@ class PDF2BPMNWorkflow:
             entity_chunk_map=self.entity_chunk_map
         )
         
-        # Create sequence flows (NEXT relationships between tasks)
+        # Store gateways for sequence flow creation
+        self.all_gateways = gateways
+        
+        # Create sequence flows (NEXT relationships between tasks/gateways)
         print("➡️ Creating sequence flows...")
         self._create_sequence_flows(unique_tasks, unique_processes)
         
@@ -427,18 +431,36 @@ class PDF2BPMNWorkflow:
         }
     
     def _create_sequence_flows(self, tasks: list, processes: list):
-        """Create NEXT relationships between tasks based on extracted and inferred sequence flows."""
+        """Create NEXT relationships between tasks/gateways based on extracted and inferred sequence flows."""
         created_flows = set()
+        
+        # Build ID sets for validation
+        task_ids = {t.task_id for t in tasks}
+        gateway_ids = {g.gateway_id for g in self.all_gateways} if hasattr(self, 'all_gateways') else set()
         
         # First, create explicit sequence flows from extraction
         for flow in self.sequence_flows:
-            from_id = flow.get("from_task_id")
-            to_id = flow.get("to_task_id")
-            condition = flow.get("condition", "")
+            # Support both old format (from_task_id) and new format (from_id)
+            from_id = flow.get("from_id") or flow.get("from_task_id")
+            to_id = flow.get("to_id") or flow.get("to_task_id")
+            from_type = flow.get("from_type", "task")
+            to_type = flow.get("to_type", "task")
+            condition = flow.get("condition", "") or ""
             
             if from_id and to_id and (from_id, to_id) not in created_flows:
-                self.neo4j.link_task_sequence(from_id, to_id, condition)
+                # Create the appropriate relationship based on types
+                if from_type == "gateway" and to_type == "task":
+                    self.neo4j.link_gateway_to_task(from_id, to_id, condition)
+                elif from_type == "task" and to_type == "gateway":
+                    self.neo4j.link_task_to_gateway(from_id, to_id)
+                else:
+                    # Task to Task
+                    self.neo4j.link_task_sequence(from_id, to_id, condition)
+                
                 created_flows.add((from_id, to_id))
+                
+                if condition:
+                    print(f"   ✓ Flow with condition: {from_type}:{from_id[:8]} → {to_type}:{to_id[:8]} [{condition}]")
         
         # Group tasks by process
         tasks_by_process = {}
