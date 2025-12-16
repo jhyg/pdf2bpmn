@@ -101,7 +101,11 @@ BPMN_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:sequenceFlow id="{{ flow.id }}" 
                        sourceRef="{{ flow.source }}" 
                        targetRef="{{ flow.target }}"
-                       {% if flow.name %}name="{{ flow.name }}"{% endif %} />
+                       {% if flow.name %}name="{{ flow.name }}"{% endif %}>
+      {% if flow.condition %}
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">{{ flow.condition }}</bpmn:conditionExpression>
+      {% endif %}
+    </bpmn:sequenceFlow>
     {% endfor %}
     
   </bpmn:process>
@@ -111,24 +115,78 @@ BPMN_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <bpmndi:BPMNPlane id="BPMNPlane_{{ process.proc_id }}" 
                       bpmnElement="Collaboration_{{ process.proc_id }}">
       
+      <!-- Participant (Pool) -->
       <bpmndi:BPMNShape id="Participant_{{ process.proc_id }}_di" 
                         bpmnElement="Participant_{{ process.proc_id }}" 
                         isHorizontal="true">
-        <dc:Bounds x="160" y="80" width="{{ 200 + tasks|length * 180 }}" height="{{ 100 + roles|length * 120 }}" />
+        <dc:Bounds x="160" y="80" width="{{ 300 + tasks|length * 180 }}" height="{{ 150 + (roles|length + 1) * 120 }}" />
       </bpmndi:BPMNShape>
       
+      <!-- Lanes -->
       {% for i, role in enumerate(roles) %}
       <bpmndi:BPMNShape id="Lane_{{ role.role_id }}_di" 
                         bpmnElement="Lane_{{ role.role_id }}" 
                         isHorizontal="true">
-        <dc:Bounds x="190" y="{{ 80 + i * 120 }}" width="{{ 170 + tasks|length * 180 }}" height="120" />
+        <dc:Bounds x="190" y="{{ 80 + i * 120 }}" width="{{ 270 + tasks|length * 180 }}" height="120" />
+      </bpmndi:BPMNShape>
+      {% endfor %}
+      {% if unassigned_tasks %}
+      <bpmndi:BPMNShape id="Lane_Unassigned_di" 
+                        bpmnElement="Lane_Unassigned" 
+                        isHorizontal="true">
+        <dc:Bounds x="190" y="{{ 80 + roles|length * 120 }}" width="{{ 270 + tasks|length * 180 }}" height="120" />
+      </bpmndi:BPMNShape>
+      {% endif %}
+      
+      <!-- Start Events -->
+      {% for event in events if event.event_type.value == 'start' %}
+      <bpmndi:BPMNShape id="StartEvent_{{ event.event_id }}_di" bpmnElement="StartEvent_{{ event.event_id }}">
+        <dc:Bounds x="232" y="{{ 130 + task_lane_index.get(tasks[0].task_id if tasks else '', 0) * 120 }}" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      {% endfor %}
+      {% if not start_events %}
+      <bpmndi:BPMNShape id="StartEvent_Default_di" bpmnElement="StartEvent_Default">
+        <dc:Bounds x="232" y="{{ 130 + task_lane_index.get(tasks[0].task_id if tasks else '', 0) * 120 }}" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      {% endif %}
+      
+      <!-- Tasks -->
+      {% for i, task in enumerate(tasks) %}
+      <bpmndi:BPMNShape id="Task_{{ task.task_id }}_di" bpmnElement="Task_{{ task.task_id }}">
+        <dc:Bounds x="{{ 320 + i * 180 }}" y="{{ 110 + task_lane_index.get(task.task_id, 0) * 120 }}" width="100" height="80" />
       </bpmndi:BPMNShape>
       {% endfor %}
       
-      {% for i, task in enumerate(tasks) %}
-      <bpmndi:BPMNShape id="Task_{{ task.task_id }}_di" bpmnElement="Task_{{ task.task_id }}">
-        <dc:Bounds x="{{ 300 + i * 180 }}" y="{{ 110 + task_lane_index.get(task.task_id, 0) * 120 }}" width="100" height="80" />
+      <!-- Gateways -->
+      {% for i, gateway in enumerate(gateways) %}
+      <bpmndi:BPMNShape id="Gateway_{{ gateway.gateway_id }}_di" bpmnElement="Gateway_{{ gateway.gateway_id }}" isMarkerVisible="true">
+        <dc:Bounds x="{{ 320 + (tasks|length + i) * 180 }}" y="{{ 125 }}" width="50" height="50" />
       </bpmndi:BPMNShape>
+      {% endfor %}
+      
+      <!-- End Events -->
+      {% for event in events if event.event_type.value == 'end' %}
+      <bpmndi:BPMNShape id="EndEvent_{{ event.event_id }}_di" bpmnElement="EndEvent_{{ event.event_id }}">
+        <dc:Bounds x="{{ 320 + (tasks|length + gateways|length) * 180 + 50 }}" y="{{ 130 + task_lane_index.get(tasks[-1].task_id if tasks else '', 0) * 120 }}" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      {% endfor %}
+      {% if not end_events %}
+      <bpmndi:BPMNShape id="EndEvent_Default_di" bpmnElement="EndEvent_Default">
+        <dc:Bounds x="{{ 320 + (tasks|length + gateways|length) * 180 + 50 }}" y="{{ 130 + task_lane_index.get(tasks[-1].task_id if tasks else '', 0) * 120 }}" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      {% endif %}
+      
+      <!-- Sequence Flow Edges -->
+      {% for flow in sequence_flows %}
+      <bpmndi:BPMNEdge id="{{ flow.id }}_di" bpmnElement="{{ flow.id }}">
+        <di:waypoint x="{{ flow.source_x }}" y="{{ flow.source_y }}" />
+        <di:waypoint x="{{ flow.target_x }}" y="{{ flow.target_y }}" />
+        {% if flow.condition %}
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="{{ (flow.source_x + flow.target_x) // 2 - 30 }}" y="{{ (flow.source_y + flow.target_y) // 2 - 20 }}" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+        {% endif %}
+      </bpmndi:BPMNEdge>
       {% endfor %}
       
     </bpmndi:BPMNPlane>
@@ -151,11 +209,24 @@ class BPMNGenerator:
         roles: list[Role],
         gateways: list[Gateway],
         events: list[Event],
-        task_role_map: dict[str, str] = None
+        task_role_map: dict[str, str] = None,
+        neo4j_sequence_flows: list[dict] = None
     ) -> str:
-        """Generate BPMN XML for a process."""
+        """Generate BPMN XML for a process.
+        
+        Args:
+            process: The main process
+            tasks: List of tasks
+            roles: List of roles
+            gateways: List of gateways
+            events: List of events
+            task_role_map: Mapping of task_id to role_id
+            neo4j_sequence_flows: Sequence flows from Neo4j with conditions
+                [{from_id, from_type, to_id, to_type, condition}, ...]
+        """
         
         task_role_map = task_role_map or {}
+        neo4j_sequence_flows = neo4j_sequence_flows or []
         
         # Organize tasks by role
         tasks_by_role = {}
@@ -181,9 +252,15 @@ class BPMNGenerator:
         start_events = [e for e in events if e.event_type == EventType.START]
         end_events = [e for e in events if e.event_type == EventType.END]
         
-        # Generate sequence flows
+        # Build position maps for DI elements
+        sorted_tasks = sorted(tasks, key=lambda t: t.order)
+        element_positions = self._calculate_element_positions(
+            sorted_tasks, gateways, start_events, end_events, task_lane_index, len(roles)
+        )
+        
+        # Generate sequence flows (using Neo4j flows if available)
         sequence_flows = self._generate_sequence_flows(
-            tasks, gateways, start_events, end_events
+            tasks, gateways, start_events, end_events, neo4j_sequence_flows, element_positions
         )
         
         # Render template
@@ -209,84 +286,206 @@ class BPMNGenerator:
         tasks: list[Task],
         gateways: list[Gateway],
         start_events: list[Event],
-        end_events: list[Event]
+        end_events: list[Event],
+        neo4j_flows: list[dict] = None,
+        element_positions: dict = None
     ) -> list[dict]:
-        """Generate sequence flow connections."""
+        """Generate sequence flow connections using Neo4j NEXT relationships.
+        
+        Args:
+            neo4j_flows: [{from_id, from_type, to_id, to_type, condition}, ...]
+            element_positions: {element_ref: {x, y, width, height}, ...}
+        """
         flows = []
         sorted_tasks = sorted(tasks, key=lambda t: t.order)
+        neo4j_flows = neo4j_flows or []
+        element_positions = element_positions or {}
+        
+        def add_flow(flow_id: str, source_ref: str, target_ref: str, condition: str = None):
+            """Helper to add flow with coordinates."""
+            source_pos = element_positions.get(source_ref, {"x": 0, "y": 150, "width": 36, "height": 36})
+            target_pos = element_positions.get(target_ref, {"x": 100, "y": 150, "width": 100, "height": 80})
+            
+            source_x, source_y, target_x, target_y = self._get_connection_points(source_pos, target_pos)
+            
+            flows.append({
+                "id": flow_id,
+                "source": source_ref,
+                "target": target_ref,
+                "name": condition if condition else None,
+                "condition": condition,
+                "source_x": source_x,
+                "source_y": source_y,
+                "target_x": target_x,
+                "target_y": target_y
+            })
+        
+        added_flow_ids = set()
         
         # Flow from start event to first task
         if sorted_tasks:
             first_task = sorted_tasks[0]
             if start_events:
                 for event in start_events:
-                    flows.append({
-                        "id": f"Flow_Start_{event.event_id}",
-                        "source": f"StartEvent_{event.event_id}",
-                        "target": f"Task_{first_task.task_id}",
-                        "name": None
-                    })
+                    flow_id = f"Flow_Start_{event.event_id}"
+                    if flow_id not in added_flow_ids:
+                        add_flow(flow_id, f"StartEvent_{event.event_id}", f"Task_{first_task.task_id}")
+                        added_flow_ids.add(flow_id)
             else:
-                flows.append({
-                    "id": "Flow_Start_Default",
-                    "source": "StartEvent_Default",
-                    "target": f"Task_{first_task.task_id}",
-                    "name": None
-                })
-            
-            # Flow to first task (incoming)
-            flows.append({
-                "id": f"Flow_To_{first_task.task_id}",
-                "source": start_events[0].event_id if start_events else "StartEvent_Default",
-                "target": f"Task_{first_task.task_id}",
-                "name": None
-            })
+                flow_id = "Flow_Start_Default"
+                if flow_id not in added_flow_ids:
+                    add_flow(flow_id, "StartEvent_Default", f"Task_{first_task.task_id}")
+                    added_flow_ids.add(flow_id)
         
-        # Flows between tasks
+        # Add flows from Neo4j NEXT relationships (with conditions)
+        added_pairs = set()
+        for flow in neo4j_flows:
+            from_id = flow.get("from_id")
+            from_type = flow.get("from_type")
+            to_id = flow.get("to_id")
+            to_type = flow.get("to_type")
+            condition = flow.get("condition")
+            
+            if not from_id or not to_id:
+                continue
+            
+            # Format source and target refs based on type
+            source_ref = self._format_bpmn_ref(from_id, from_type)
+            target_ref = self._format_bpmn_ref(to_id, to_type)
+            
+            flow_id = f"Flow_{from_id[:8]}_{to_id[:8]}"
+            if flow_id not in added_flow_ids:
+                add_flow(flow_id, source_ref, target_ref, condition)
+                added_flow_ids.add(flow_id)
+                added_pairs.add((from_id, to_id))
+        
+        # Flows between tasks (fallback for tasks not connected via Neo4j)
         for i, task in enumerate(sorted_tasks):
             if i < len(sorted_tasks) - 1:
                 next_task = sorted_tasks[i + 1]
-                flows.append({
-                    "id": f"Flow_From_{task.task_id}",
-                    "source": f"Task_{task.task_id}",
-                    "target": f"Task_{next_task.task_id}",
-                    "name": None
-                })
-                flows.append({
-                    "id": f"Flow_To_{next_task.task_id}",
-                    "source": f"Task_{task.task_id}",
-                    "target": f"Task_{next_task.task_id}",
-                    "name": None
-                })
+                
+                # Skip if already added from Neo4j
+                if (task.task_id, next_task.task_id) in added_pairs:
+                    continue
+                
+                flow_id = f"Flow_{task.task_id[:8]}_{next_task.task_id[:8]}"
+                if flow_id not in added_flow_ids:
+                    add_flow(flow_id, f"Task_{task.task_id}", f"Task_{next_task.task_id}")
+                    added_flow_ids.add(flow_id)
         
         # Flow from last task to end event
         if sorted_tasks:
             last_task = sorted_tasks[-1]
-            if end_events:
-                for event in end_events:
-                    flows.append({
-                        "id": f"Flow_End_{event.event_id}",
-                        "source": f"Task_{last_task.task_id}",
-                        "target": f"EndEvent_{event.event_id}",
-                        "name": None
-                    })
-            else:
-                flows.append({
-                    "id": "Flow_End_Default",
-                    "source": f"Task_{last_task.task_id}",
-                    "target": "EndEvent_Default",
-                    "name": None
-                })
+            # Check if last task already connected to end event via Neo4j
+            has_end_connection = any(
+                f.get("from_id") == last_task.task_id and f.get("to_type") == "Event"
+                for f in neo4j_flows
+            )
             
-            # Outgoing flow from last task
-            flows.append({
-                "id": f"Flow_From_{last_task.task_id}",
-                "source": f"Task_{last_task.task_id}",
-                "target": end_events[0].event_id if end_events else "EndEvent_Default",
-                "name": None
-            })
+            if not has_end_connection:
+                if end_events:
+                    for event in end_events:
+                        flow_id = f"Flow_End_{event.event_id}"
+                        if flow_id not in added_flow_ids:
+                            add_flow(flow_id, f"Task_{last_task.task_id}", f"EndEvent_{event.event_id}")
+                            added_flow_ids.add(flow_id)
+                else:
+                    flow_id = "Flow_End_Default"
+                    if flow_id not in added_flow_ids:
+                        add_flow(flow_id, f"Task_{last_task.task_id}", "EndEvent_Default")
+                        added_flow_ids.add(flow_id)
         
         return flows
+    
+    def _format_bpmn_ref(self, entity_id: str, entity_type: str) -> str:
+        """Format BPMN element reference based on entity type."""
+        if entity_type == "Task":
+            return f"Task_{entity_id}"
+        elif entity_type == "Gateway":
+            return f"Gateway_{entity_id}"
+        elif entity_type == "Event":
+            return f"Event_{entity_id}"
+        else:
+            return entity_id
+    
+    def _calculate_element_positions(
+        self,
+        tasks: list[Task],
+        gateways: list[Gateway],
+        start_events: list[Event],
+        end_events: list[Event],
+        task_lane_index: dict,
+        num_roles: int
+    ) -> dict:
+        """Calculate x, y positions for all BPMN elements.
+        
+        Returns:
+            dict mapping element_ref (e.g., "Task_xxx", "Gateway_xxx") to {x, y, width, height}
+        """
+        positions = {}
+        
+        # Start event position
+        start_x = 250
+        start_y = 148  # Center of first lane
+        
+        if start_events:
+            for event in start_events:
+                positions[f"StartEvent_{event.event_id}"] = {
+                    "x": start_x, "y": start_y, "width": 36, "height": 36
+                }
+        else:
+            positions["StartEvent_Default"] = {
+                "x": start_x, "y": start_y, "width": 36, "height": 36
+            }
+        
+        # Task positions
+        for i, task in enumerate(tasks):
+            lane_idx = task_lane_index.get(task.task_id, 0)
+            task_x = 320 + i * 180
+            task_y = 110 + lane_idx * 120
+            positions[f"Task_{task.task_id}"] = {
+                "x": task_x, "y": task_y, "width": 100, "height": 80
+            }
+        
+        # Gateway positions
+        for i, gateway in enumerate(gateways):
+            gw_x = 320 + (len(tasks) + i) * 180
+            gw_y = 125
+            positions[f"Gateway_{gateway.gateway_id}"] = {
+                "x": gw_x, "y": gw_y, "width": 50, "height": 50
+            }
+        
+        # End event position
+        end_x = 320 + (len(tasks) + len(gateways)) * 180 + 50
+        end_y = 148
+        
+        if end_events:
+            for event in end_events:
+                positions[f"EndEvent_{event.event_id}"] = {
+                    "x": end_x, "y": end_y, "width": 36, "height": 36
+                }
+        else:
+            positions["EndEvent_Default"] = {
+                "x": end_x, "y": end_y, "width": 36, "height": 36
+            }
+        
+        return positions
+    
+    def _get_connection_points(self, source_pos: dict, target_pos: dict) -> tuple:
+        """Calculate connection points between two elements.
+        
+        Returns:
+            tuple: (source_x, source_y, target_x, target_y)
+        """
+        # Source: right edge center
+        source_x = source_pos["x"] + source_pos["width"]
+        source_y = source_pos["y"] + source_pos["height"] // 2
+        
+        # Target: left edge center
+        target_x = target_pos["x"]
+        target_y = target_pos["y"] + target_pos["height"] // 2
+        
+        return source_x, source_y, target_x, target_y
     
     def save(self, bpmn_xml: str, output_path: str) -> str:
         """Save BPMN XML to file."""

@@ -737,6 +737,56 @@ class Neo4jClient:
         with self.session() as session:
             session.run(query, {"amb_id": amb_id, "answer": answer})
     
+    def get_sequence_flows(self, process_id: str = None) -> list[dict]:
+        """Get all NEXT relationships with their conditions.
+        
+        Returns:
+            list of {from_id, from_type, from_name, to_id, to_type, to_name, condition}
+        """
+        query = """
+        MATCH (from)-[r:NEXT]->(to)
+        WHERE (from:Task OR from:Gateway OR from:Event)
+          AND (to:Task OR to:Gateway OR to:Event)
+        RETURN 
+            CASE 
+                WHEN from:Task THEN from.task_id
+                WHEN from:Gateway THEN from.gateway_id
+                WHEN from:Event THEN from.event_id
+            END as from_id,
+            CASE 
+                WHEN from:Task THEN 'Task'
+                WHEN from:Gateway THEN 'Gateway'
+                WHEN from:Event THEN 'Event'
+            END as from_type,
+            from.name as from_name,
+            CASE 
+                WHEN to:Task THEN to.task_id
+                WHEN to:Gateway THEN to.gateway_id
+                WHEN to:Event THEN to.event_id
+            END as to_id,
+            CASE 
+                WHEN to:Task THEN 'Task'
+                WHEN to:Gateway THEN 'Gateway'
+                WHEN to:Event THEN 'Event'
+            END as to_type,
+            to.name as to_name,
+            r.condition as condition
+        """
+        with self.session() as session:
+            result = session.run(query)
+            flows = []
+            for record in result:
+                flows.append({
+                    "from_id": record["from_id"],
+                    "from_type": record["from_type"],
+                    "from_name": record["from_name"],
+                    "to_id": record["to_id"],
+                    "to_type": record["to_type"],
+                    "to_name": record["to_name"],
+                    "condition": record["condition"]
+                })
+            return flows
+    
     def search_similar_by_name(
         self, 
         entity_type: str, 

@@ -106,8 +106,46 @@
               <h4 class="text-lg font-semibold">{{ selectedElement.name || selectedElement.id }}</h4>
             </div>
             
-            <!-- Description -->
-            <div v-if="elementDetail?.element?.description" class="p-3 rounded-lg bg-blue-500/10 border border-blue-500/30">
+            <!-- Sequence Flow Info (when clicking on a flow/arrow) -->
+            <div v-if="selectedElement.isSequenceFlow" class="space-y-3">
+              <!-- Flow Direction -->
+              <div class="p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/30">
+                <label class="text-xs text-cyan-400 uppercase tracking-wider flex items-center space-x-1">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+                  </svg>
+                  <span>흐름 방향</span>
+                </label>
+                <div class="mt-2 flex items-center space-x-2">
+                  <span class="text-sm text-gray-300">{{ selectedElement.sourceRef }}</span>
+                  <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                  </svg>
+                  <span class="text-sm text-gray-300">{{ selectedElement.targetRef }}</span>
+                </div>
+              </div>
+              
+              <!-- Condition (if exists) -->
+              <div v-if="selectedElement.condition" class="p-4 rounded-lg bg-yellow-500/20 border-2 border-yellow-500/50">
+                <label class="text-xs text-yellow-400 uppercase tracking-wider flex items-center space-x-1 mb-2">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span>조건 (Condition)</span>
+                </label>
+                <p class="text-base font-medium text-yellow-200">{{ selectedElement.condition }}</p>
+              </div>
+              
+              <!-- No Condition -->
+              <div v-else class="p-3 rounded-lg bg-gray-500/10 border border-gray-500/30">
+                <p class="text-sm text-gray-400 text-center">
+                  조건 없음 (기본 흐름)
+                </p>
+              </div>
+            </div>
+            
+            <!-- Description (for non-sequence-flow elements) -->
+            <div v-if="!selectedElement.isSequenceFlow && elementDetail?.element?.description" class="p-3 rounded-lg bg-blue-500/10 border border-blue-500/30">
               <label class="text-xs text-blue-400 uppercase tracking-wider flex items-center space-x-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -117,8 +155,8 @@
               <p class="text-sm text-gray-300 mt-2">{{ elementDetail.element.description }}</p>
             </div>
             
-            <!-- Role Info -->
-            <div v-if="elementDetail?.role" class="p-3 rounded-lg bg-purple-500/10 border border-purple-500/30">
+            <!-- Role Info (not for sequence flows) -->
+            <div v-if="!selectedElement.isSequenceFlow && elementDetail?.role" class="p-3 rounded-lg bg-purple-500/10 border border-purple-500/30">
               <label class="text-xs text-purple-400 uppercase tracking-wider flex items-center space-x-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
@@ -131,8 +169,8 @@
               </p>
             </div>
             
-            <!-- Process Info -->
-            <div v-if="elementDetail?.process" class="p-3 rounded-lg bg-green-500/10 border border-green-500/30">
+            <!-- Process Info (not for sequence flows) -->
+            <div v-if="!selectedElement.isSequenceFlow && elementDetail?.process" class="p-3 rounded-lg bg-green-500/10 border border-green-500/30">
               <label class="text-xs text-green-400 uppercase tracking-wider flex items-center space-x-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6z" />
@@ -142,8 +180,8 @@
               <p class="font-medium mt-2">{{ elementDetail.process.name }}</p>
             </div>
             
-            <!-- Sequence Info -->
-            <div v-if="elementDetail?.next_tasks?.length || elementDetail?.prev_tasks?.length" 
+            <!-- Sequence Info (not for sequence flows) -->
+            <div v-if="!selectedElement.isSequenceFlow && (elementDetail?.next_tasks?.length || elementDetail?.prev_tasks?.length)" 
                  class="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30">
               <label class="text-xs text-yellow-400 uppercase tracking-wider flex items-center space-x-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -167,8 +205,8 @@
               </div>
             </div>
             
-            <!-- Evidence / Source Documents -->
-            <div v-if="elementDetail?.evidences?.length" class="space-y-3">
+            <!-- Evidence / Source Documents (not for sequence flows) -->
+            <div v-if="!selectedElement.isSequenceFlow && elementDetail?.evidences?.length" class="space-y-3">
               <label class="text-xs text-orange-400 uppercase tracking-wider flex items-center space-x-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -189,8 +227,8 @@
               </div>
             </div>
             
-            <!-- No Evidence -->
-            <div v-else-if="!loadingDetail" class="p-3 rounded-lg bg-gray-500/10 border border-gray-500/30">
+            <!-- No Evidence (not for sequence flows) -->
+            <div v-else-if="!selectedElement.isSequenceFlow && !loadingDetail" class="p-3 rounded-lg bg-gray-500/10 border border-gray-500/30">
               <p class="text-sm text-gray-400 text-center">
                 출처 문서 정보가 없습니다
               </p>
@@ -279,6 +317,7 @@ function elementTypeClass(type) {
     'StartEvent': 'bg-green-500/20 text-green-400',
     'EndEvent': 'bg-red-500/20 text-red-400',
     'Event': 'bg-purple-500/20 text-purple-400',
+    'SequenceFlow': 'bg-cyan-500/20 text-cyan-400',
   }
   return classes[type] || 'bg-gray-500/20 text-gray-400'
 }
@@ -321,11 +360,32 @@ async function loadBpmn() {
     eventBus.on('element.click', (e) => {
       const element = e.element
       if (element.type !== 'bpmn:Process' && element.type !== 'label') {
-        selectedElement.value = {
-          id: element.id,
-          name: element.businessObject?.name || element.id,
-          type: element.type.replace('bpmn:', ''),
-          description: element.businessObject?.documentation?.[0]?.text
+        const bo = element.businessObject
+        
+        // Handle SequenceFlow with condition
+        if (element.type === 'bpmn:SequenceFlow') {
+          const condition = bo?.conditionExpression?.body || bo?.name || null
+          const sourceRef = bo?.sourceRef?.name || bo?.sourceRef?.id || 'Unknown'
+          const targetRef = bo?.targetRef?.name || bo?.targetRef?.id || 'Unknown'
+          
+          selectedElement.value = {
+            id: element.id,
+            name: bo?.name || `${sourceRef} → ${targetRef}`,
+            type: 'SequenceFlow',
+            description: condition ? `조건: ${condition}` : null,
+            isSequenceFlow: true,
+            condition: condition,
+            sourceRef: sourceRef,
+            targetRef: targetRef
+          }
+        } else {
+          selectedElement.value = {
+            id: element.id,
+            name: bo?.name || element.id,
+            type: element.type.replace('bpmn:', ''),
+            description: bo?.documentation?.[0]?.text,
+            isSequenceFlow: false
+          }
         }
       }
     })
@@ -366,26 +426,67 @@ function fitToViewport() {
   display: none !important;
 }
 
+/* BPMN Elements (Tasks, Events, Gateways) */
 .djs-element .djs-visual > :first-child {
   fill: #1e293b !important;
-  stroke: #64748b !important;
+  stroke: #94a3b8 !important;
 }
 
 .djs-element .djs-visual text {
-  fill: #e2e8f0 !important;
+  fill: #f1f5f9 !important;
 }
 
-.djs-connection .djs-visual > :first-child {
-  stroke: #64748b !important;
+/* Sequence Flows (Lines/Arrows) - Bright color */
+.djs-connection .djs-visual path {
+  stroke: #38bdf8 !important;
+  stroke-width: 2px !important;
 }
 
-.djs-element:hover .djs-visual > :first-child {
+.djs-connection .djs-visual polyline {
+  stroke: #38bdf8 !important;
+  stroke-width: 2px !important;
+}
+
+/* All SVG paths in connections */
+g.djs-group g.djs-element.djs-connection g.djs-visual path {
+  stroke: #38bdf8 !important;
+  stroke-width: 2px !important;
+}
+
+/* Sequence Flow Arrow markers (defined in defs) */
+svg defs marker path {
+  fill: #38bdf8 !important;
   stroke: #38bdf8 !important;
 }
 
+/* Sequence Flow Labels */
+.djs-connection .djs-visual text,
+.djs-label text {
+  fill: #fbbf24 !important;
+  font-size: 11px !important;
+}
+
+/* Hover effects */
+.djs-element:hover .djs-visual > :first-child {
+  stroke: #22d3ee !important;
+}
+
+.djs-connection:hover .djs-visual path,
+.djs-connection:hover .djs-visual polyline {
+  stroke: #67e8f9 !important;
+  stroke-width: 3px !important;
+}
+
+/* Selected element */
 .djs-element.selected .djs-visual > :first-child {
   stroke: #a78bfa !important;
   stroke-width: 2px !important;
+}
+
+.djs-connection.selected .djs-visual path,
+.djs-connection.selected .djs-visual polyline {
+  stroke: #c4b5fd !important;
+  stroke-width: 3px !important;
 }
 </style>
 

@@ -949,13 +949,25 @@ class PDF2BPMNWorkflow:
         for task in process_tasks:
             task.process_id = main_process.proc_id
         
+        # Get sequence flows from Neo4j (with conditions on NEXT relationships)
+        neo4j_sequence_flows = self.neo4j.get_sequence_flows(main_process.proc_id)
+        print(f"   Retrieved {len(neo4j_sequence_flows)} sequence flows from Neo4j")
+        
+        # Log flows with conditions
+        flows_with_conditions = [f for f in neo4j_sequence_flows if f.get("condition")]
+        if flows_with_conditions:
+            print(f"   Including {len(flows_with_conditions)} conditional flows:")
+            for flow in flows_with_conditions[:5]:  # Show first 5
+                print(f"      {flow.get('from_name')} → {flow.get('to_name')}: {flow.get('condition')}")
+        
         bpmn_xml = self.bpmn_generator.generate(
             process=main_process,
             tasks=process_tasks,
             roles=roles,
             gateways=gateways,
             events=events,
-            task_role_map=self.task_role_map
+            task_role_map=self.task_role_map,
+            neo4j_sequence_flows=neo4j_sequence_flows
         )
         
         bpmn_path = Config.OUTPUT_DIR / "process.bpmn"
