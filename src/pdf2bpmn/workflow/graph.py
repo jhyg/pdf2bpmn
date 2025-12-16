@@ -129,14 +129,34 @@ class PDF2BPMNWorkflow:
                 section_chunk_id = chunk_by_page[section.page_from][0].chunk_id
             
             # Extract entities from section content with existing context
-            # 기존 프로세스/역할 목록을 LLM에 전달하여 동일 프로세스 식별 개선
+            # 기존 프로세스/역할/태스크 목록을 LLM에 전달하여 동일 엔티티 식별 개선
             existing_process_names = list(self.process_name_to_id.keys())
             existing_role_names = list(self.role_name_to_id.keys())
+            
+            # 기존 태스크 정보 수집 (이름, 역할, 프로세스)
+            existing_tasks_info = []
+            for task in all_tasks:
+                task_info = {"name": task.name, "order": task.order}
+                # 태스크의 역할 찾기
+                if task.task_id in self.task_role_map:
+                    role_id = self.task_role_map[task.task_id]
+                    for role_name, rid in self.role_name_to_id.items():
+                        if rid == role_id:
+                            task_info["role"] = role_name
+                            break
+                # 태스크의 프로세스 찾기
+                if task.process_id:
+                    for proc_name, pid in self.process_name_to_id.items():
+                        if pid == task.process_id:
+                            task_info["process"] = proc_name
+                            break
+                existing_tasks_info.append(task_info)
             
             extracted = self.entity_extractor.extract_from_text(
                 section.content,
                 existing_processes=existing_process_names,
-                existing_roles=existing_role_names
+                existing_roles=existing_role_names,
+                existing_tasks=existing_tasks_info
             )
             
             # Convert to entity objects with relationships
@@ -232,15 +252,35 @@ class PDF2BPMNWorkflow:
             if section.page_from in chunk_by_page and chunk_by_page[section.page_from]:
                 section_chunk_id = chunk_by_page[section.page_from][0].chunk_id
             
-            # Extract entities with existing context
+            # Extract entities with existing context (프로세스, 역할, 태스크 모두 포함)
             existing_process_names = list(self.process_name_to_id.keys())
             existing_role_names = list(self.role_name_to_id.keys())
+            
+            # 기존 태스크 정보 수집 (이름, 역할, 프로세스)
+            existing_tasks_info = []
+            for task in all_tasks:
+                task_info = {"name": task.name, "order": task.order}
+                # 태스크의 역할 찾기
+                if task.task_id in self.task_role_map:
+                    role_id = self.task_role_map[task.task_id]
+                    for role_name, rid in self.role_name_to_id.items():
+                        if rid == role_id:
+                            task_info["role"] = role_name
+                            break
+                # 태스크의 프로세스 찾기
+                if task.process_id:
+                    for proc_name, pid in self.process_name_to_id.items():
+                        if pid == task.process_id:
+                            task_info["process"] = proc_name
+                            break
+                existing_tasks_info.append(task_info)
             
             try:
                 extracted = self.entity_extractor.extract_from_text(
                     section.content,
                     existing_processes=existing_process_names,
-                    existing_roles=existing_role_names
+                    existing_roles=existing_role_names,
+                    existing_tasks=existing_tasks_info
                 )
                 
                 # Convert to entity objects
@@ -318,6 +358,10 @@ class PDF2BPMNWorkflow:
         
         # 4. task_process_map도 업데이트
         self._update_task_process_map(process_id_mapping)
+        
+        # 5. 유사한 태스크 병합 (같은 역할의 연속 업무)
+        tasks, task_id_mapping = self._merge_similar_tasks(tasks)
+        print(f"   Tasks after merge: {len(tasks)}")
         
         # Deduplicate tasks
         unique_tasks = self._deduplicate_entities(tasks, "Task")
@@ -536,6 +580,147 @@ class PDF2BPMNWorkflow:
                 new_proc_id = process_id_mapping[proc_id]
                 if proc_id != new_proc_id:
                     self.task_process_map[task_id] = new_proc_id
+    
+    def _merge_similar_tasks(self, tasks: list) -> tuple[list, dict]:
+        """유사한 태스크를 병합합니다.
+        
+        병합 기준:
+        1. 같은 프로세스 내에서
+        2. 같은 역할이 수행하며
+        3. 이름이 유사하거나 하나가 다른 하나를 포함하는 경우
+        
+        Returns:
+            tuple: (병합된 태스크 리스트, {old_task_id: new_task_id} 매핑)
+        """
+        if not tasks:
+            return tasks, {}
+        
+        task_id_mapping = {}  # old_id -> new_id
+        
+        # 프로세스별로 그룹화
+        tasks_by_process = {}
+        for task in tasks:
+            proc_id = task.process_id or "no_process"
+            if proc_id not in tasks_by_process:
+                tasks_by_process[proc_id] = []
+            tasks_by_process[proc_id].append(task)
+        
+        merged_tasks = []
+        
+        for proc_id, proc_tasks in tasks_by_process.items():
+            # 역할별로 그룹화
+            tasks_by_role = {}
+            for task in proc_tasks:
+                role_id = self.task_role_map.get(task.task_id, "no_role")
+                if role_id not in tasks_by_role:
+                    tasks_by_role[role_id] = []
+                tasks_by_role[role_id].append(task)
+            
+            for role_id, role_tasks in tasks_by_role.items():
+                # 같은 역할의 태스크들 중 유사한 것들 병합
+                merged_role_tasks = self._merge_tasks_by_similarity(role_tasks, task_id_mapping)
+                merged_tasks.extend(merged_role_tasks)
+        
+        # task_role_map 업데이트
+        for old_id, new_id in task_id_mapping.items():
+            if old_id in self.task_role_map and old_id != new_id:
+                self.task_role_map[new_id] = self.task_role_map[old_id]
+        
+        return merged_tasks, task_id_mapping
+    
+    def _merge_tasks_by_similarity(self, tasks: list, task_id_mapping: dict) -> list:
+        """이름 유사도를 기반으로 태스크를 병합합니다."""
+        if len(tasks) <= 1:
+            return tasks
+        
+        # order로 정렬
+        sorted_tasks = sorted(tasks, key=lambda t: t.order)
+        merged = []
+        skip_indices = set()
+        
+        for i, task in enumerate(sorted_tasks):
+            if i in skip_indices:
+                continue
+            
+            task_name = task.name.lower().strip()
+            merged_with = []
+            
+            # 다른 태스크와 비교
+            for j, other_task in enumerate(sorted_tasks):
+                if i == j or j in skip_indices:
+                    continue
+                
+                other_name = other_task.name.lower().strip()
+                
+                # 병합 조건 체크
+                should_merge = False
+                
+                # 1. 한쪽이 다른 쪽을 포함
+                if task_name in other_name or other_name in task_name:
+                    should_merge = True
+                
+                # 2. 핵심 단어가 같은 경우 (ex: "구매요청서 접수" vs "구매요청서 접수 및 검토")
+                elif self._have_same_core_words(task_name, other_name):
+                    should_merge = True
+                
+                # 3. 연속된 order이고 이름이 매우 유사
+                elif abs(task.order - other_task.order) <= 1:
+                    similarity = self._calc_name_similarity(task_name, other_name)
+                    if similarity > 0.6:
+                        should_merge = True
+                
+                if should_merge:
+                    merged_with.append((j, other_task))
+                    skip_indices.add(j)
+            
+            # 병합 수행
+            if merged_with:
+                # 가장 긴 이름을 가진 태스크를 대표로 선택
+                all_related = [task] + [t for _, t in merged_with]
+                representative = max(all_related, key=lambda t: len(t.name))
+                
+                # 설명 통합
+                descriptions = [t.description for t in all_related if t.description]
+                if descriptions:
+                    representative.description = " | ".join(set(descriptions))
+                
+                # ID 매핑 기록
+                for t in all_related:
+                    if t.task_id != representative.task_id:
+                        task_id_mapping[t.task_id] = representative.task_id
+                
+                merged.append(representative)
+                print(f"   🔀 병합: {[t.name for t in all_related]} → {representative.name}")
+            else:
+                merged.append(task)
+        
+        return merged
+    
+    def _have_same_core_words(self, name1: str, name2: str) -> bool:
+        """두 이름이 핵심 단어를 공유하는지 확인합니다."""
+        # 한국어 조사/어미 제거를 위한 간단한 처리
+        stop_words = {'및', '의', '을', '를', '이', '가', '에', '로', '으로', '와', '과', '에서', '부터', '까지'}
+        
+        words1 = set(name1.replace(' ', '').replace('및', ' ').split()) - stop_words
+        words2 = set(name2.replace(' ', '').replace('및', ' ').split()) - stop_words
+        
+        # 공통 단어가 2개 이상이면 유사
+        common = words1 & words2
+        return len(common) >= 1 and len(common) >= min(len(words1), len(words2)) * 0.5
+    
+    def _calc_name_similarity(self, name1: str, name2: str) -> float:
+        """두 이름의 유사도를 계산합니다 (0~1)."""
+        # 간단한 Jaccard similarity
+        set1 = set(name1)
+        set2 = set(name2)
+        
+        if not set1 or not set2:
+            return 0.0
+        
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        
+        return intersection / union if union > 0 else 0.0
     
     def _deduplicate_entities(self, entities: list, entity_type: str) -> list:
         """Deduplicate entities based on name similarity."""

@@ -99,12 +99,13 @@ Respond with a JSON object containing arrays for each entity type.
 Return ONLY valid JSON, no markdown formatting."""
 
 
-# Context template for existing processes/roles
+# Context template for existing processes/roles/tasks
 EXISTING_CONTEXT_TEMPLATE = """
 **IMPORTANT - EXISTING ENTITIES (이미 추출된 엔티티들):**
 
 {process_list}
 {role_list}
+{task_list}
 
 **CRITICAL RULES FOR PROCESS IDENTIFICATION (프로세스 식별 규칙):**
 1. If a task clearly belongs to an EXISTING process listed above, use that EXACT process name for parent_process.
@@ -125,6 +126,25 @@ EXISTING_CONTEXT_TEMPLATE = """
 6. For existing roles, use the EXACT same name - do not create duplicates with slightly different names.
    (기존 역할의 경우 정확히 같은 이름을 사용하세요 - 약간 다른 이름으로 중복 생성하지 마세요)
 
+**CRITICAL RULES FOR TASK DEDUPLICATION (태스크 중복 제거 규칙):**
+7. BEFORE creating a new task, check the EXISTING TASKS list above. If a similar task already exists, DO NOT create a duplicate.
+   (새 태스크를 만들기 전에 위의 기존 태스크 목록을 확인하세요. 유사한 태스크가 이미 있으면 중복 생성하지 마세요)
+
+8. Tasks performed by the SAME ROLE in sequence WITHOUT requiring other department collaboration should be MERGED into ONE task.
+   (다른 부서 협업 없이 같은 역할이 연속으로 수행하는 작업은 하나의 태스크로 통합해야 합니다)
+   Examples of tasks to MERGE (통합해야 할 태스크 예시):
+   - "구매요청서 접수" + "형식 검토" → "구매요청서 접수 및 형식 검토" (same role: 구매담당자)
+   - "견적서 검토" + "견적 비교" → "견적서 검토 및 비교" (same role)
+
+9. Tasks are SEPARATE only when:
+   - Different roles perform them (역할이 다를 때)
+   - There is a waiting/approval point between them (승인/대기 시점이 있을 때)
+   - They belong to different stages requiring handoff (업무 인계가 필요한 다른 단계일 때)
+
+10. If the current text provides MORE DETAIL about an existing task, DO NOT create a new task.
+    Instead, the existing task's description should be enhanced (but this is handled in post-processing).
+    (현재 텍스트가 기존 태스크에 대한 추가 설명이면 새 태스크를 만들지 마세요)
+
 """
 
 
@@ -144,10 +164,17 @@ class EntityExtractor:
     def _build_context(
         self, 
         existing_processes: list[str] = None, 
-        existing_roles: list[str] = None
+        existing_roles: list[str] = None,
+        existing_tasks: list[dict] = None
     ) -> str:
-        """기존 프로세스/역할 목록으로 컨텍스트 문자열 생성"""
-        if not existing_processes and not existing_roles:
+        """기존 프로세스/역할/태스크 목록으로 컨텍스트 문자열 생성
+        
+        Args:
+            existing_processes: 기존 프로세스 이름 목록
+            existing_roles: 기존 역할 이름 목록
+            existing_tasks: 기존 태스크 목록 [{name, role, process, order}, ...]
+        """
+        if not existing_processes and not existing_roles and not existing_tasks:
             return ""
         
         process_list = ""
@@ -160,16 +187,31 @@ class EntityExtractor:
             role_list = "**기존 역할 목록 (Existing Roles):**\n" + \
                        "\n".join(f"  - {r}" for r in existing_roles)
         
+        task_list = ""
+        if existing_tasks:
+            task_entries = []
+            for t in existing_tasks:
+                entry = f"  - {t.get('name', 'Unknown')}"
+                if t.get('role'):
+                    entry += f" (담당: {t['role']})"
+                if t.get('process'):
+                    entry += f" [프로세스: {t['process']}]"
+                task_entries.append(entry)
+            task_list = "**기존 태스크 목록 (Existing Tasks - DO NOT DUPLICATE):**\n" + \
+                       "\n".join(task_entries)
+        
         return EXISTING_CONTEXT_TEMPLATE.format(
             process_list=process_list,
-            role_list=role_list
+            role_list=role_list,
+            task_list=task_list
         )
     
     def extract_from_text(
         self, 
         text: str,
         existing_processes: list[str] = None,
-        existing_roles: list[str] = None
+        existing_roles: list[str] = None,
+        existing_tasks: list[dict] = None
     ) -> ExtractedEntities:
         """Extract entities from text using LLM.
         
@@ -177,13 +219,18 @@ class EntityExtractor:
             text: 분석할 텍스트
             existing_processes: 이미 추출된 프로세스 이름 목록
             existing_roles: 이미 추출된 역할 이름 목록
+            existing_tasks: 이미 추출된 태스크 목록 [{name, role, process, order}, ...]
         
         Returns:
             ExtractedEntities: 추출된 엔티티들
         """
         try:
-            # 기존 컨텍스트 생성
-            existing_context = self._build_context(existing_processes, existing_roles)
+            # 기존 컨텍스트 생성 (프로세스, 역할, 태스크 모두 포함)
+            existing_context = self._build_context(
+                existing_processes, 
+                existing_roles,
+                existing_tasks
+            )
             
             result = self.chain.invoke({
                 "text": text,
