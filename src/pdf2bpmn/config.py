@@ -30,8 +30,12 @@ class Config:
     CONFIDENCE_THRESHOLD: float = 0.8
     SIMILARITY_MERGE_THRESHOLD: float = 0.90
     SIMILARITY_REVIEW_THRESHOLD: float = 0.80
-    CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 200
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1000"))
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))
+    
+    # Performance optimization options
+    EVIDENCE_MODE: str = os.getenv("EVIDENCE_MODE", "full")  # "full", "reference_only", "off"
+    CHUNKING_STRATEGY: str = os.getenv("CHUNKING_STRATEGY", "fixed")  # "fixed", "semantic"
     
     @classmethod
     def ensure_dirs(cls):

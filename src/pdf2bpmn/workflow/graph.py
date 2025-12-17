@@ -402,11 +402,13 @@ class PDF2BPMNWorkflow:
         
         # Create relationships in batch
         print("🔗 Creating entity relationships...")
+        # Only create evidence links if not disabled
+        evidence_map = {} if Config.EVIDENCE_MODE == "off" else self.entity_chunk_map
         self.neo4j.create_all_relationships(
             task_role_map=self.task_role_map,
             task_process_map=self.task_process_map,
             role_decision_map=self.role_decision_map,
-            entity_chunk_map=self.entity_chunk_map
+            entity_chunk_map=evidence_map
         )
         
         # Store gateways for sequence flow creation
@@ -949,7 +951,7 @@ class PDF2BPMNWorkflow:
         }
     
     def assemble_bpmn(self, state: GraphState) -> GraphState:
-        """Node: Assemble final BPMN XML."""
+        """Node: Assemble final BPMN XML - one per process."""
         print("🔧 Assembling BPMN XML...")
         
         processes = state.get("processes", [])
@@ -959,44 +961,104 @@ class PDF2BPMNWorkflow:
         events = state.get("events", [])
         
         if not processes:
-            processes = [Process(
+            # Create a default process if none exists
+            default_process = Process(
                 name="Extracted Process",
                 purpose="Automatically extracted from document",
                 description="Process extracted from PDF document"
-            )]
+            )
+            processes = [default_process]
+            # Assign all unassigned tasks to the default process
+            for task in tasks:
+                if not task.process_id:
+                    task.process_id = default_process.proc_id
         
-        main_process = processes[0]
-        process_tasks = [t for t in tasks if t.process_id == main_process.proc_id or not t.process_id]
+        # Generate BPMN for each process
+        bpmn_xmls = {}  # process_id -> bpmn_xml
+        bpmn_files = {}  # process_id -> file_path
         
-        for task in process_tasks:
-            task.process_id = main_process.proc_id
+        print(f"   Processing {len(processes)} process(es)...")
         
-        # Get sequence flows from Neo4j (with conditions on NEXT relationships)
-        neo4j_sequence_flows = self.neo4j.get_sequence_flows(main_process.proc_id)
-        print(f"   Retrieved {len(neo4j_sequence_flows)} sequence flows from Neo4j")
+        for process in processes:
+            print(f"\n   📋 Processing: {process.name} (ID: {process.proc_id})")
+            
+            # Filter entities by process_id
+            process_tasks = [t for t in tasks if t.process_id == process.proc_id or (not t.process_id and process == processes[0])]
+            process_gateways = [g for g in gateways if g.process_id == process.proc_id or (not g.process_id and process == processes[0])]
+            process_events = [e for e in events if e.process_id == process.proc_id or (not e.process_id and process == processes[0])]
+            
+            # Assign unassigned entities to this process (only for first process)
+            if process == processes[0]:
+                for task in process_tasks:
+                    if not task.process_id:
+                        task.process_id = process.proc_id
+                for gateway in process_gateways:
+                    if not gateway.process_id:
+                        gateway.process_id = process.proc_id
+                for event in process_events:
+                    if not event.process_id:
+                        event.process_id = process.proc_id
+            
+            print(f"      Tasks: {len(process_tasks)}, Gateways: {len(process_gateways)}, Events: {len(process_events)}")
+            
+            # Get roles used by tasks in this process
+            process_task_ids = {t.task_id for t in process_tasks}
+            process_role_ids = set()
+            for task_id, role_id in self.task_role_map.items():
+                if task_id in process_task_ids:
+                    process_role_ids.add(role_id)
+            
+            process_roles = [r for r in roles if r.role_id in process_role_ids]
+            print(f"      Roles: {len(process_roles)}")
+            
+            # Get sequence flows from Neo4j for this process
+            neo4j_sequence_flows = self.neo4j.get_sequence_flows(process.proc_id)
+            print(f"      Sequence flows: {len(neo4j_sequence_flows)}")
+            
+            # Log flows with conditions
+            flows_with_conditions = [f for f in neo4j_sequence_flows if f.get("condition")]
+            if flows_with_conditions:
+                print(f"      Conditional flows: {len(flows_with_conditions)}")
+                for flow in flows_with_conditions[:3]:  # Show first 3
+                    print(f"         {flow.get('from_name')} → {flow.get('to_name')}: {flow.get('condition')}")
+            
+            # Generate BPMN XML for this process
+            bpmn_xml = self.bpmn_generator.generate(
+                process=process,
+                tasks=process_tasks,
+                roles=process_roles,
+                gateways=process_gateways,
+                events=process_events,
+                task_role_map=self.task_role_map,
+                neo4j_sequence_flows=neo4j_sequence_flows
+            )
+            
+            # Save to file with process-specific name
+            # Use sanitized process name for filename
+            safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in process.name)
+            safe_name = safe_name.replace(' ', '_').replace('-', '_')[:40]  # Limit length
+            # Use full proc_id (already UUID) for uniqueness
+            bpmn_filename = f"process_{safe_name}_{process.proc_id}.bpmn"
+            bpmn_path = Config.OUTPUT_DIR / bpmn_filename
+            
+            self.bpmn_generator.save(bpmn_xml, str(bpmn_path))
+            print(f"      ✅ Saved: {bpmn_filename}")
+            
+            bpmn_xmls[process.proc_id] = bpmn_xml
+            bpmn_files[process.proc_id] = str(bpmn_path)
         
-        # Log flows with conditions
-        flows_with_conditions = [f for f in neo4j_sequence_flows if f.get("condition")]
-        if flows_with_conditions:
-            print(f"   Including {len(flows_with_conditions)} conditional flows:")
-            for flow in flows_with_conditions[:5]:  # Show first 5
-                print(f"      {flow.get('from_name')} → {flow.get('to_name')}: {flow.get('condition')}")
+        # For backward compatibility, keep the first BPMN as the main one
+        main_bpmn_xml = bpmn_xmls.get(processes[0].proc_id) if processes else None
         
-        bpmn_xml = self.bpmn_generator.generate(
-            process=main_process,
-            tasks=process_tasks,
-            roles=roles,
-            gateways=gateways,
-            events=events,
-            task_role_map=self.task_role_map,
-            neo4j_sequence_flows=neo4j_sequence_flows
-        )
-        
-        bpmn_path = Config.OUTPUT_DIR / "process.bpmn"
-        self.bpmn_generator.save(bpmn_xml, str(bpmn_path))
+        # Also save the first one as process.bpmn for backward compatibility
+        if main_bpmn_xml:
+            default_bpmn_path = Config.OUTPUT_DIR / "process.bpmn"
+            self.bpmn_generator.save(main_bpmn_xml, str(default_bpmn_path))
         
         return {
-            "bpmn_xml": bpmn_xml,
+            "bpmn_xml": main_bpmn_xml,  # Backward compatibility
+            "bpmn_xmls": bpmn_xmls,  # All BPMN XMLs keyed by process_id
+            "bpmn_files": bpmn_files,  # File paths keyed by process_id
             "current_step": "validate_consistency"
         }
     

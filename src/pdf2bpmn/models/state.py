@@ -71,7 +71,9 @@ class GraphState(TypedDict):
     error: str | None
     
     # Outputs
-    bpmn_xml: str | None
+    bpmn_xml: str | None  # Main BPMN XML (backward compatibility - first process)
+    bpmn_xmls: dict[str, str]  # process_id -> bpmn_xml (all processes)
+    bpmn_files: dict[str, str]  # process_id -> file_path (all BPMN files)
     skill_docs: dict[str, str]  # skill_id -> markdown content
     dmn_xml: str | None
 

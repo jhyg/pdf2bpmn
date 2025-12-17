@@ -219,6 +219,8 @@ async def process_pdf_background(job_id: str):
             "current_step": "ingest_pdf",
             "error": None,
             "bpmn_xml": None,
+            "bpmn_xmls": {},
+            "bpmn_files": {},
             "skill_docs": {},
             "dmn_xml": None
         }
@@ -283,18 +285,15 @@ async def process_pdf_background(job_id: str):
         update_step(job, 4, "completed", 75, "관계 생성 완료")
         await asyncio.sleep(0)
         
-        # Step 6: Generate BPMN
+        # Step 6: Generate Skills
         update_step(job, 5, "processing", 78, "Agent Skill 문서 생성 중...")
         await asyncio.sleep(0)
         result = await loop.run_in_executor(executor, workflow.generate_skills, state)
         state.update(result)
+        update_step(job, 5, "completed", 82, "Agent Skill 문서 생성 완료")
+        await asyncio.sleep(0)
         
-        update_step(job, 5, "processing", 82, "BPMN XML 생성 중...")
-        await asyncio.sleep(0)
-        result = await loop.run_in_executor(executor, workflow.assemble_bpmn, state)
-        state.update(result)
-        update_step(job, 5, "completed", 85, "BPMN 생성 완료")
-        await asyncio.sleep(0)
+        # Note: BPMN is now generated on-demand when viewing processes, not during ingestion
         
         # Step 7: Generate DMN
         update_step(job, 6, "processing", 88, "DMN 의사결정 테이블 생성 중...")
@@ -314,13 +313,20 @@ async def process_pdf_background(job_id: str):
         # Store result summary
         job["status"] = "completed"
         job["detail_message"] = "모든 처리가 완료되었습니다!"
+        
+        # Collect BPMN file information
+        bpmn_files = state.get("bpmn_files", {})
+        bpmn_paths = list(bpmn_files.values()) if bpmn_files else [str(Config.OUTPUT_DIR / "process.bpmn")]
+        
         job["result"] = {
             "processes": len(state.get("processes", [])),
             "tasks": len(state.get("tasks", [])),
             "roles": len(state.get("roles", [])),
             "gateways": len(state.get("gateways", [])),
             "decisions": len(state.get("dmn_decisions", [])),
-            "bpmn_path": str(Config.OUTPUT_DIR / "process.bpmn"),
+            "bpmn_path": bpmn_paths[0] if bpmn_paths else str(Config.OUTPUT_DIR / "process.bpmn"),  # Backward compatibility
+            "bpmn_paths": bpmn_paths,  # All BPMN file paths
+            "bpmn_files": bpmn_files,  # process_id -> file_path mapping
             "dmn_path": str(Config.OUTPUT_DIR / "decisions.dmn")
         }
         
@@ -404,23 +410,73 @@ async def get_processes():
     """Get all processes."""
     neo4j = Neo4jClient()
     try:
+        # Verify Neo4j connection first
+        if not neo4j.verify_connection():
+            raise HTTPException(503, "Neo4j connection failed")
+        
         with neo4j.session() as session:
+            # First check if there are any processes
+            count_result = session.run("MATCH (p:Process) RETURN count(p) as count")
+            count_record = count_result.single()
+            process_count = count_record["count"] if count_record else 0
+            
+            print(f"[API] Found {process_count} processes in Neo4j")
+            
+            if process_count == 0:
+                return {"processes": []}
+            
+            # Simplified query - avoid potential NULL issues
             result = session.run("""
                 MATCH (p:Process)
                 OPTIONAL MATCH (p)-[:HAS_TASK]->(t:Task)
-                OPTIONAL MATCH (p)<-[:SUPPORTED_BY]-(c:ReferenceChunk)
-                WITH p, count(DISTINCT t) as taskCount, collect(DISTINCT {page: c.page, text: c.text})[0] as evidence
-                RETURN p {.*, taskCount: taskCount} as process, evidence
+                WITH p, count(DISTINCT t) as taskCount
+                RETURN p.proc_id as proc_id,
+                       COALESCE(p.name, '') as name,
+                       COALESCE(p.purpose, '') as purpose,
+                       COALESCE(p.description, '') as description,
+                       CASE WHEN p.triggers IS NULL THEN [] ELSE p.triggers END as triggers,
+                       CASE WHEN p.outcomes IS NULL THEN [] ELSE p.outcomes END as outcomes,
+                       COALESCE(taskCount, 0) as taskCount
                 ORDER BY p.name
             """)
             processes = []
             for record in result:
-                proc = record["process"]
-                proc["evidence"] = record["evidence"]
-                processes.append(proc)
+                try:
+                    proc = {
+                        "proc_id": str(record["proc_id"]) if record["proc_id"] else "",
+                        "name": str(record["name"]) if record["name"] else "",
+                        "purpose": str(record["purpose"]) if record["purpose"] else "",
+                        "description": str(record["description"]) if record["description"] else "",
+                        "triggers": list(record["triggers"]) if record["triggers"] else [],
+                        "outcomes": list(record["outcomes"]) if record["outcomes"] else [],
+                        "taskCount": int(record["taskCount"]) if record["taskCount"] is not None else 0,
+                        "evidence": None
+                    }
+                    # Validate required fields
+                    if proc["proc_id"] and proc["name"]:
+                        processes.append(proc)
+                    else:
+                        print(f"[API] Skipping invalid process: {proc}")
+                except Exception as e:
+                    print(f"[API] Error processing process record: {e}, record: {dict(record)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            print(f"[API] Returning {len(processes)} processes")
             return {"processes": processes}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] Error fetching processes: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Error fetching processes: {str(e)}")
     finally:
-        neo4j.close()
+        try:
+            neo4j.close()
+        except:
+            pass
 
 
 @app.get("/api/processes/{proc_id}")
@@ -722,21 +778,177 @@ async def get_graph_stats():
 # ==================== File APIs ====================
 
 @app.get("/api/files/bpmn")
-async def get_bpmn_file():
-    """Get the generated BPMN file."""
-    bpmn_path = Config.OUTPUT_DIR / "process.bpmn"
-    if not bpmn_path.exists():
-        raise HTTPException(404, "BPMN file not found")
-    return FileResponse(bpmn_path, media_type="application/xml", filename="process.bpmn")
+async def get_bpmn_file(process_id: Optional[str] = None):
+    """Get the generated BPMN file - dynamically generated from Neo4j.
+    
+    Args:
+        process_id: Optional process ID to get a specific process BPMN.
+                   If not provided, returns the first process BPMN.
+    """
+    from ..generators.bpmn_generator import BPMNGenerator
+    from fastapi.responses import Response
+    
+    neo4j = Neo4jClient()
+    try:
+        # Get process ID if not provided
+        if not process_id:
+            all_processes = neo4j.get_all_processes()
+            if not all_processes:
+                raise HTTPException(404, "No processes found in database")
+            process_id = all_processes[0]["proc_id"]
+        
+        # Get all entities for the process from Neo4j
+        entities = neo4j.get_process_entities_for_bpmn(process_id)
+        if not entities:
+            raise HTTPException(404, f"Process {process_id} not found")
+        
+        # Get sequence flows
+        sequence_flows = neo4j.get_sequence_flows(process_id)
+        
+        # Generate BPMN XML
+        bpmn_generator = BPMNGenerator()
+        bpmn_xml = bpmn_generator.generate(
+            process=entities["process"],
+            tasks=entities["tasks"],
+            roles=entities["roles"],
+            gateways=entities["gateways"],
+            events=entities["events"],
+            task_role_map=entities["task_role_map"],
+            neo4j_sequence_flows=sequence_flows
+        )
+        
+        # Create filename
+        safe_name = entities["process"].name.replace(" ", "_").replace("/", "_")[:50]
+        filename = f"process_{safe_name}_{process_id[:8]}.bpmn"
+        
+        return Response(
+            content=bpmn_xml,
+            media_type="application/xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/files/bpmn/list")
+async def list_bpmn_files():
+    """List all processes that can generate BPMN (from Neo4j)."""
+    neo4j = Neo4jClient()
+    try:
+        processes = neo4j.get_all_processes()
+        files = []
+        for proc in processes:
+            safe_name = proc["name"].replace(" ", "_").replace("/", "_")[:50]
+            filename = f"process_{safe_name}_{proc['proc_id'][:8]}.bpmn"
+            files.append({
+                "filename": filename,
+                "process_id": proc["proc_id"],
+                "process_name": proc["name"],
+                "is_default": False
+            })
+        
+        # Mark first as default
+        if files:
+            files[0]["is_default"] = True
+        
+        return {"files": files, "count": len(files)}
+    finally:
+        neo4j.close()
 
 
 @app.get("/api/files/bpmn/content")
-async def get_bpmn_content():
-    """Get BPMN file content as text."""
-    bpmn_path = Config.OUTPUT_DIR / "process.bpmn"
-    if not bpmn_path.exists():
-        raise HTTPException(404, "BPMN file not found")
-    return {"content": bpmn_path.read_text(encoding="utf-8")}
+async def get_bpmn_content(process_id: Optional[str] = None):
+    """Get BPMN file content as text.
+    
+    Args:
+        process_id: Optional process ID to get a specific process BPMN.
+                   If not provided, returns the default (first) BPMN content.
+    """
+    from ..generators.bpmn_generator import BPMNGenerator
+    
+    neo4j = Neo4jClient()
+    try:
+        # Get process ID if not provided
+        if not process_id:
+            all_processes = neo4j.get_all_processes()
+            if not all_processes:
+                raise HTTPException(404, "No processes found in database")
+            process_id = all_processes[0]["proc_id"]
+        
+        # Get all entities for the process from Neo4j
+        entities = neo4j.get_process_entities_for_bpmn(process_id)
+        if not entities:
+            raise HTTPException(404, f"Process {process_id} not found")
+        
+        # Get sequence flows
+        sequence_flows = neo4j.get_sequence_flows(process_id)
+        
+        # Generate BPMN XML
+        bpmn_generator = BPMNGenerator()
+        bpmn_xml = bpmn_generator.generate(
+            process=entities["process"],
+            tasks=entities["tasks"],
+            roles=entities["roles"],
+            gateways=entities["gateways"],
+            events=entities["events"],
+            task_role_map=entities["task_role_map"],
+            neo4j_sequence_flows=sequence_flows
+        )
+        
+        return {
+            "content": bpmn_xml,
+            "process_id": process_id,
+            "process_name": entities["process"].name
+        }
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/files/bpmn/all")
+async def get_all_bpmn_contents():
+    """Get all BPMN file contents - dynamically generated from Neo4j."""
+    from ..generators.bpmn_generator import BPMNGenerator
+    
+    neo4j = Neo4jClient()
+    try:
+        processes = neo4j.get_all_processes()
+        results = {}
+        bpmn_generator = BPMNGenerator()
+        
+        for proc in processes:
+            proc_id = proc["proc_id"]
+            
+            # Get all entities for the process
+            entities = neo4j.get_process_entities_for_bpmn(proc_id)
+            if not entities:
+                continue
+            
+            # Get sequence flows
+            sequence_flows = neo4j.get_sequence_flows(proc_id)
+            
+            # Generate BPMN XML
+            bpmn_xml = bpmn_generator.generate(
+                process=entities["process"],
+                tasks=entities["tasks"],
+                roles=entities["roles"],
+                gateways=entities["gateways"],
+                events=entities["events"],
+                task_role_map=entities["task_role_map"],
+                neo4j_sequence_flows=sequence_flows
+            )
+            
+            safe_name = proc["name"].replace(" ", "_").replace("/", "_")[:50]
+            filename = f"process_{safe_name}_{proc_id[:8]}.bpmn"
+            
+            results[proc_id] = {
+                "content": bpmn_xml,
+                "filename": filename,
+                "process_name": proc["name"]
+            }
+        
+        return {"bpmn_files": results, "count": len(results)}
+    finally:
+        neo4j.close()
 
 
 @app.get("/api/files/dmn")

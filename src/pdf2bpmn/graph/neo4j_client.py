@@ -728,6 +728,134 @@ class Neo4jClient:
                 }
             return None
     
+    def get_process_entities_for_bpmn(self, proc_id: str) -> dict:
+        """Get all entities for a process to generate BPMN.
+        
+        Returns:
+            dict with Process, Task, Gateway, Event, Role objects and task_role_map
+        """
+        from ..models.entities import (
+            Process, Task, Role, Gateway, Event,
+            TaskType, GatewayType, EventType
+        )
+        
+        query = """
+        MATCH (p:Process {proc_id: $proc_id})
+        OPTIONAL MATCH (p)-[:HAS_TASK]->(t:Task)
+        OPTIONAL MATCH (p)-[:HAS_GATEWAY]->(g:Gateway)
+        OPTIONAL MATCH (p)-[:HAS_EVENT]->(e:Event)
+        OPTIONAL MATCH (t)-[:PERFORMED_BY]->(r:Role)
+        RETURN p,
+               collect(DISTINCT t) as tasks,
+               collect(DISTINCT g) as gateways,
+               collect(DISTINCT e) as events,
+               collect(DISTINCT r) as roles
+        """
+        
+        with self.session() as session:
+            result = session.run(query, {"proc_id": proc_id})
+            record = result.single()
+            
+            if not record or not record["p"]:
+                return None
+            
+            # Convert Process
+            proc_data = dict(record["p"])
+            process = Process(
+                proc_id=proc_data["proc_id"],
+                name=proc_data.get("name", ""),
+                purpose=proc_data.get("purpose", ""),
+                description=proc_data.get("description", ""),
+                triggers=proc_data.get("triggers", []),
+                outcomes=proc_data.get("outcomes", [])
+            )
+            
+            # Convert Tasks and build task_role_map in one query
+            tasks = []
+            task_role_map = {}
+            
+            # Get all task-role relationships for this process in one query
+            task_role_query = """
+            MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(t:Task)-[:PERFORMED_BY]->(r:Role)
+            RETURN t.task_id as task_id, r.role_id as role_id
+            """
+            task_role_result = session.run(task_role_query, {"proc_id": proc_id})
+            for tr_record in task_role_result:
+                task_role_map[tr_record["task_id"]] = tr_record["role_id"]
+            
+            # Convert tasks
+            for task_data in record["tasks"]:
+                if not task_data:
+                    continue
+                task_dict = dict(task_data)
+                task = Task(
+                    task_id=task_dict["task_id"],
+                    process_id=proc_id,
+                    name=task_dict.get("name", ""),
+                    task_type=TaskType(task_dict.get("task_type", "human")),
+                    description=task_dict.get("description", ""),
+                    order=task_dict.get("order", 0)
+                )
+                tasks.append(task)
+            
+            # Convert Gateways
+            gateways = []
+            for gateway_data in record["gateways"]:
+                if not gateway_data:
+                    continue
+                gateway_dict = dict(gateway_data)
+                gateway = Gateway(
+                    gateway_id=gateway_dict["gateway_id"],
+                    process_id=proc_id,
+                    name=gateway_dict.get("name", ""),
+                    gateway_type=GatewayType(gateway_dict.get("gateway_type", "exclusive")),
+                    condition=gateway_dict.get("condition", ""),
+                    description=gateway_dict.get("description", "")
+                )
+                gateways.append(gateway)
+            
+            # Convert Events
+            events = []
+            for event_data in record["events"]:
+                if not event_data:
+                    continue
+                event_dict = dict(event_data)
+                event = Event(
+                    event_id=event_dict["event_id"],
+                    process_id=proc_id,
+                    event_type=EventType(event_dict.get("event_type", "start")),
+                    name=event_dict.get("name", ""),
+                    trigger=event_dict.get("trigger", "")
+                )
+                events.append(event)
+            
+            # Convert Roles (distinct)
+            roles = []
+            seen_role_ids = set()
+            for role_data in record["roles"]:
+                if not role_data:
+                    continue
+                role_dict = dict(role_data)
+                role_id = role_dict.get("role_id")
+                if role_id and role_id not in seen_role_ids:
+                    role = Role(
+                        role_id=role_id,
+                        name=role_dict.get("name", ""),
+                        org_unit=role_dict.get("org_unit", ""),
+                        persona_hint=role_dict.get("persona_hint", "")
+                    )
+                    roles.append(role)
+                    seen_role_ids.add(role_id)
+            
+            return {
+                "process": process,
+                "tasks": tasks,
+                "gateways": gateways,
+                "events": events,
+                "roles": roles,
+                "task_role_map": task_role_map
+            }
+    
     def get_open_ambiguities(self) -> list[dict]:
         """Get all open ambiguity questions."""
         query = """
@@ -754,40 +882,91 @@ class Neo4jClient:
     def get_sequence_flows(self, process_id: str = None) -> list[dict]:
         """Get all NEXT relationships with their conditions.
         
+        Args:
+            process_id: Optional process ID to filter flows within a specific process.
+                       If None, returns all flows.
+        
         Returns:
             list of {from_id, from_type, from_name, to_id, to_type, to_name, condition}
         """
-        query = """
-        MATCH (from)-[r:NEXT]->(to)
-        WHERE (from:Task OR from:Gateway OR from:Event)
-          AND (to:Task OR to:Gateway OR to:Event)
-        RETURN 
-            CASE 
-                WHEN from:Task THEN from.task_id
-                WHEN from:Gateway THEN from.gateway_id
-                WHEN from:Event THEN from.event_id
-            END as from_id,
-            CASE 
-                WHEN from:Task THEN 'Task'
-                WHEN from:Gateway THEN 'Gateway'
-                WHEN from:Event THEN 'Event'
-            END as from_type,
-            from.name as from_name,
-            CASE 
-                WHEN to:Task THEN to.task_id
-                WHEN to:Gateway THEN to.gateway_id
-                WHEN to:Event THEN to.event_id
-            END as to_id,
-            CASE 
-                WHEN to:Task THEN 'Task'
-                WHEN to:Gateway THEN 'Gateway'
-                WHEN to:Event THEN 'Event'
-            END as to_type,
-            to.name as to_name,
-            r.condition as condition
-        """
+        if process_id:
+            # Filter flows within a specific process
+            query = """
+            MATCH (p:Process {proc_id: $process_id})
+            MATCH (from)-[r:NEXT]->(to)
+            WHERE (from:Task OR from:Gateway OR from:Event)
+              AND (to:Task OR to:Gateway OR to:Event)
+              AND (
+                (from:Task AND (p)-[:HAS_TASK]->(from))
+                OR (from:Gateway AND (p)-[:HAS_GATEWAY]->(from))
+                OR (from:Event AND (p)-[:HAS_EVENT]->(from))
+              )
+              AND (
+                (to:Task AND (p)-[:HAS_TASK]->(to))
+                OR (to:Gateway AND (p)-[:HAS_GATEWAY]->(to))
+                OR (to:Event AND (p)-[:HAS_EVENT]->(to))
+              )
+            RETURN 
+                CASE 
+                    WHEN from:Task THEN from.task_id
+                    WHEN from:Gateway THEN from.gateway_id
+                    WHEN from:Event THEN from.event_id
+                END as from_id,
+                CASE 
+                    WHEN from:Task THEN 'Task'
+                    WHEN from:Gateway THEN 'Gateway'
+                    WHEN from:Event THEN 'Event'
+                END as from_type,
+                from.name as from_name,
+                CASE 
+                    WHEN to:Task THEN to.task_id
+                    WHEN to:Gateway THEN to.gateway_id
+                    WHEN to:Event THEN to.event_id
+                END as to_id,
+                CASE 
+                    WHEN to:Task THEN 'Task'
+                    WHEN to:Gateway THEN 'Gateway'
+                    WHEN to:Event THEN 'Event'
+                END as to_type,
+                to.name as to_name,
+                r.condition as condition
+            """
+            params = {"process_id": process_id}
+        else:
+            # Get all flows
+            query = """
+            MATCH (from)-[r:NEXT]->(to)
+            WHERE (from:Task OR from:Gateway OR from:Event)
+              AND (to:Task OR to:Gateway OR to:Event)
+            RETURN 
+                CASE 
+                    WHEN from:Task THEN from.task_id
+                    WHEN from:Gateway THEN from.gateway_id
+                    WHEN from:Event THEN from.event_id
+                END as from_id,
+                CASE 
+                    WHEN from:Task THEN 'Task'
+                    WHEN from:Gateway THEN 'Gateway'
+                    WHEN from:Event THEN 'Event'
+                END as from_type,
+                from.name as from_name,
+                CASE 
+                    WHEN to:Task THEN to.task_id
+                    WHEN to:Gateway THEN to.gateway_id
+                    WHEN to:Event THEN to.event_id
+                END as to_id,
+                CASE 
+                    WHEN to:Task THEN 'Task'
+                    WHEN to:Gateway THEN 'Gateway'
+                    WHEN to:Event THEN 'Event'
+                END as to_type,
+                to.name as to_name,
+                r.condition as condition
+            """
+            params = {}
+        
         with self.session() as session:
-            result = session.run(query)
+            result = session.run(query, params)
             flows = []
             for record in result:
                 flows.append({

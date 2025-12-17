@@ -301,6 +301,8 @@ def render_processing_section():
             "current_step": "ingest_pdf",
             "error": None,
             "bpmn_xml": None,
+            "bpmn_xmls": {},
+            "bpmn_files": {},
             "skill_docs": {},
             "dmn_xml": None
         }

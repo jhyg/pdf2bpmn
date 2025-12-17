@@ -1,53 +1,141 @@
 <template>
   <div class="h-[calc(100vh-8rem)] flex flex-col">
-    <!-- Header -->
-    <div class="glass border-b border-white/10 px-6 py-4">
-      <div class="flex items-center justify-between">
-        <div>
-          <h1 class="text-2xl font-bold">프로세스 뷰어</h1>
-          <p class="text-gray-400 text-sm">BPMN.io로 시각화된 프로세스 다이어그램</p>
+    <!-- Process Selection View (shown initially or when no process selected) -->
+    <div v-if="showProcessList" class="flex-1 overflow-y-auto p-6">
+      <div class="max-w-6xl mx-auto">
+        <div class="mb-6">
+          <h1 class="text-3xl font-bold mb-2">프로세스 선택</h1>
+          <p class="text-gray-400">표시할 프로세스를 선택하세요</p>
         </div>
-        <div class="flex items-center space-x-3">
-          <button 
-            @click="zoomIn"
-            class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
-            title="확대"
-          >
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+
+        <!-- Loading State -->
+        <div v-if="loadingProcesses" class="flex items-center justify-center py-12">
+          <svg class="w-8 h-8 animate-spin text-blue-500" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+          <span class="ml-3 text-gray-400">프로세스 목록 로딩 중...</span>
+        </div>
+
+        <!-- Error State -->
+        <div v-else-if="error" class="text-center py-12">
+          <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-red-500/20 flex items-center justify-center">
+            <svg class="w-8 h-8 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
+          </div>
+          <p class="text-red-400 text-lg mb-2">오류 발생</p>
+          <p class="text-gray-400 text-sm mb-4">{{ error }}</p>
+          <button @click="loadProcesses" class="px-4 py-2 bg-blue-500 rounded-lg hover:bg-blue-600 transition-all">
+            다시 시도
           </button>
-          <button 
-            @click="zoomOut"
-            class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
-            title="축소"
-          >
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM13 10H7" />
+        </div>
+
+        <!-- Empty State -->
+        <div v-else-if="!loadingProcesses && processes.length === 0 && !error" class="text-center py-12">
+          <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-gray-500/20 flex items-center justify-center">
+            <svg class="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
-          </button>
-          <button 
-            @click="fitToViewport"
-            class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
-            title="화면에 맞추기"
+          </div>
+          <p class="text-gray-400 text-lg mb-2">프로세스가 없습니다</p>
+          <p class="text-gray-500 text-sm">먼저 PDF를 업로드하고 변환해주세요</p>
+        </div>
+
+        <!-- Process Grid -->
+        <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div
+            v-for="process in processes"
+            :key="process.proc_id"
+            @click="selectProcess(process.proc_id)"
+            class="glass rounded-xl p-6 cursor-pointer transition-all hover:bg-white/10 hover:scale-105 border border-white/10 hover:border-blue-500/50"
           >
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
-            </svg>
-          </button>
-          <a 
-            href="/api/files/bpmn"
-            download="process.bpmn"
-            class="px-4 py-2 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg text-sm font-medium hover:from-blue-600 hover:to-purple-700 transition-all"
-          >
-            📥 BPMN 다운로드
-          </a>
+            <div class="flex items-start justify-between mb-4">
+              <div class="w-12 h-12 rounded-lg bg-blue-500/20 flex items-center justify-center flex-shrink-0">
+                <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6z" />
+                </svg>
+              </div>
+              <span v-if="process.taskCount" class="px-2 py-1 text-xs rounded-full bg-blue-500/20 text-blue-400">
+                {{ process.taskCount }}개 태스크
+              </span>
+            </div>
+            <h3 class="text-lg font-semibold mb-2">{{ process.name }}</h3>
+            <p v-if="process.description" class="text-sm text-gray-400 line-clamp-2 mb-4">
+              {{ process.description }}
+            </p>
+            <div class="flex items-center text-sm text-blue-400">
+              <span>보기</span>
+              <svg class="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+              </svg>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- BPMN Viewer -->
-    <div class="flex-1 flex">
+    <!-- BPMN Viewer (shown when process is selected) -->
+    <div v-else class="h-[calc(100vh-8rem)] flex flex-col">
+      <!-- Header -->
+      <div class="glass border-b border-white/10 px-6 py-4">
+        <div class="flex items-center justify-between">
+          <div class="flex-1">
+            <div class="flex items-center space-x-4 mb-2">
+              <button 
+                @click="backToProcessList"
+                class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
+                title="프로세스 목록으로"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                </svg>
+              </button>
+              <h1 class="text-2xl font-bold">{{ selectedProcessName }}</h1>
+            </div>
+            <p class="text-gray-400 text-sm">BPMN.io로 시각화된 프로세스 다이어그램</p>
+          </div>
+          <div class="flex items-center space-x-3">
+            <button 
+              @click="zoomIn"
+              class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
+              title="확대"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
+              </svg>
+            </button>
+            <button 
+              @click="zoomOut"
+              class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
+              title="축소"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM13 10H7" />
+              </svg>
+            </button>
+            <button 
+              @click="fitToViewport"
+              class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-all"
+              title="화면에 맞추기"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+              </svg>
+            </button>
+            <a 
+              :href="downloadUrl"
+              :download="downloadFilename"
+              class="px-4 py-2 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg text-sm font-medium hover:from-blue-600 hover:to-purple-700 transition-all"
+            >
+              📥 BPMN 다운로드
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- BPMN Viewer -->
+      <div class="flex-1 flex">
       <!-- Diagram Area -->
       <div class="flex-1 relative bg-slate-900/50">
         <div v-if="loading" class="absolute inset-0 flex items-center justify-center">
@@ -237,11 +325,12 @@
         </div>
       </div>
     </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useAppStore } from '../stores/app'
 import axios from 'axios'
 
@@ -252,11 +341,92 @@ const error = ref(null)
 const selectedElement = ref(null)
 const elementDetail = ref(null)
 const loadingDetail = ref(false)
+const processes = ref([])
+const selectedProcessId = ref(null)
+const selectedProcessName = ref('')
+const showProcessList = ref(true)
+const loadingProcesses = ref(true)
 
 let bpmnViewer = null
 
 onMounted(async () => {
-  await loadBpmn()
+  await loadProcesses()
+  // Don't auto-load BPMN, wait for user to select a process
+  loading.value = false
+})
+
+async function loadProcesses() {
+  loadingProcesses.value = true
+  error.value = null
+  try {
+    await store.fetchProcesses()
+    processes.value = store.processes || []
+    console.log('Loaded processes:', processes.value.length, processes.value)
+    
+    if (processes.value.length === 0) {
+      console.warn('No processes found in store')
+      // Try direct API call to debug
+      try {
+        const response = await axios.get('/api/processes')
+        console.log('Direct API response:', response.data)
+        if (response.data && response.data.processes) {
+          processes.value = response.data.processes
+          store.processes = response.data.processes
+        }
+      } catch (apiError) {
+        console.error('Direct API call failed:', apiError)
+        error.value = '프로세스를 불러오는 중 오류가 발생했습니다: ' + (apiError.response?.data?.detail || apiError.message)
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load processes:', e)
+    error.value = '프로세스 목록을 불러올 수 없습니다: ' + (e.response?.data?.detail || e.message)
+  } finally {
+    loadingProcesses.value = false
+  }
+}
+
+function selectProcess(processId) {
+  const process = processes.value.find(p => p.proc_id === processId)
+  if (process) {
+    selectedProcessId.value = processId
+    selectedProcessName.value = process.name
+    showProcessList.value = false
+    loading.value = true
+    loadBpmn()
+  }
+}
+
+function backToProcessList() {
+  showProcessList.value = true
+  selectedProcessId.value = null
+  selectedProcessName.value = ''
+  if (bpmnViewer) {
+    bpmnViewer.destroy()
+    bpmnViewer = null
+  }
+  selectedElement.value = null
+  elementDetail.value = null
+}
+
+
+const downloadUrl = computed(() => {
+  if (selectedProcessId.value) {
+    return `/api/files/bpmn?process_id=${encodeURIComponent(selectedProcessId.value)}`
+  }
+  return '/api/files/bpmn'
+})
+
+const downloadFilename = computed(() => {
+  if (selectedProcessId.value) {
+    const process = processes.value.find(p => p.proc_id === selectedProcessId.value)
+    if (process) {
+      const safeName = process.name.replace(/[^a-zA-Z0-9가-힣]/g, '_')
+      return `${safeName}_${selectedProcessId.value.substring(0, 8)}.bpmn`
+    }
+    return 'process.bpmn'
+  }
+  return 'process.bpmn'
 })
 
 onUnmounted(() => {
@@ -327,10 +497,16 @@ async function loadBpmn() {
   error.value = null
   
   try {
-    const content = await store.fetchBpmnContent()
+    if (!selectedProcessId.value) {
+      error.value = '프로세스를 선택해주세요.'
+      loading.value = false
+      return
+    }
+    
+    const content = await store.fetchBpmnContent(selectedProcessId.value)
     
     if (!content) {
-      error.value = 'BPMN 파일을 찾을 수 없습니다. 먼저 PDF를 변환해주세요.'
+      error.value = 'BPMN을 생성할 수 없습니다. 프로세스 데이터를 확인해주세요.'
       loading.value = false
       return
     }

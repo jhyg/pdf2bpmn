@@ -83,10 +83,18 @@ export const useAppStore = defineStore('app', () => {
   async function fetchProcesses() {
     try {
       loading.value = true
+      error.value = null
       const response = await axios.get('/api/processes')
-      processes.value = response.data.processes
+      console.log('API response:', response.data)
+      processes.value = response.data.processes || []
+      console.log('Set processes:', processes.value.length)
+      if (processes.value.length === 0) {
+        console.warn('No processes returned from API')
+      }
     } catch (e) {
-      error.value = e.message
+      console.error('Error fetching processes:', e)
+      error.value = e.response?.data?.detail || e.message
+      processes.value = []
     } finally {
       loading.value = false
     }
@@ -137,14 +145,37 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
-  async function fetchBpmnContent() {
+  async function fetchBpmnContent(processId = null) {
     try {
-      const response = await axios.get('/api/files/bpmn/content')
+      const url = processId 
+        ? `/api/files/bpmn/content?process_id=${encodeURIComponent(processId)}`
+        : '/api/files/bpmn/content'
+      const response = await axios.get(url)
       bpmnContent.value = response.data.content
       return response.data.content
     } catch (e) {
       console.error('Failed to fetch BPMN:', e)
       return null
+    }
+  }
+
+  async function fetchBpmnList() {
+    try {
+      const response = await axios.get('/api/files/bpmn/list')
+      return response.data.files || []
+    } catch (e) {
+      console.error('Failed to fetch BPMN list:', e)
+      return []
+    }
+  }
+
+  async function fetchAllBpmnContents() {
+    try {
+      const response = await axios.get('/api/files/bpmn/all')
+      return response.data.bpmn_files || {}
+    } catch (e) {
+      console.error('Failed to fetch all BPMN contents:', e)
+      return {}
     }
   }
 
@@ -192,6 +223,8 @@ export const useAppStore = defineStore('app', () => {
     fetchDecisions,
     fetchFlows,
     fetchBpmnContent,
+    fetchBpmnList,
+    fetchAllBpmnContents,
     checkNeo4jStatus,
     clearNeo4j,
   }

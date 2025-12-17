@@ -56,6 +56,8 @@ def run_cli(pdf_paths: list[str], skip_hitl: bool = False):
         "current_step": "ingest_pdf",
         "error": None,
         "bpmn_xml": None,
+        "bpmn_xmls": {},
+        "bpmn_files": {},
         "skill_docs": {},
         "dmn_xml": None
     }
