@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from ..config import Config
 from ..graph.neo4j_client import Neo4jClient
 from ..workflow.graph import PDF2BPMNWorkflow
+from ..converters.file_to_pdf import convert_to_pdf, FileToPdfError
 
 app = FastAPI(
     title="PDF2BPMN API",
@@ -112,9 +113,11 @@ async def clear_neo4j():
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload a PDF file for processing."""
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(400, "Only PDF files are allowed")
+    """Upload a file for processing.
+
+    - Accepts any file type.
+    - If not a PDF, converts to PDF (best-effort) so the same downstream pipeline can run.
+    """
     
     # Save file
     Config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,6 +126,14 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
+
+    # Convert to PDF if needed
+    pdf_path = str(file_path)
+    if not file.filename.lower().endswith(".pdf"):
+        try:
+            pdf_path = convert_to_pdf(str(file_path), str(Config.UPLOAD_DIR))
+        except FileToPdfError as e:
+            raise HTTPException(400, f"파일을 PDF로 변환하지 못했습니다: {e}")
     
     # Create job ID
     job_id = str(uuid.uuid4())
@@ -134,13 +145,16 @@ async def upload_file(file: UploadFile = File(...)):
         "current_step": "uploaded",
         "progress": 0,
         "steps": [],
-        "file_path": str(file_path),
-        "file_name": file.filename
+        # downstream always uses PDF path
+        "file_path": str(pdf_path),
+        "file_name": file.filename,
+        "original_file_path": str(file_path),
     }
     
     return {
         "job_id": job_id,
         "file_name": file.filename,
+        "pdf_file_path": str(pdf_path),
         "message": "File uploaded successfully"
     }
 
@@ -311,12 +325,31 @@ async def process_pdf_background(job_id: str):
         update_step(job, 7, "completed", 100, "완료!")
         
         # Store result summary
-        job["status"] = "completed"
         job["detail_message"] = "모든 처리가 완료되었습니다!"
         
         # Collect BPMN file information
         bpmn_files = state.get("bpmn_files", {})
         bpmn_paths = list(bpmn_files.values()) if bpmn_files else [str(Config.OUTPUT_DIR / "process.bpmn")]
+
+        # NOTE:
+        # - 현재 파이프라인은 BPMN을 "온디맨드(조회 시 생성)"로 전환되어 있어 bpmn_files가 비어있을 수 있습니다.
+        # - 하지만 agent(워커)가 "이번 job에서 생성된 프로세스만" 정확히 식별하려면 process_id 목록이 필요합니다.
+        processes_state = state.get("processes", []) or []
+        process_ids: list[str] = []
+        process_names: dict[str, str] = {}
+        for p in processes_state:
+            pid = None
+            pname = None
+            if isinstance(p, dict):
+                pid = p.get("proc_id") or p.get("process_id") or p.get("id")
+                pname = p.get("name")
+            else:
+                pid = getattr(p, "proc_id", None) or getattr(p, "process_id", None) or getattr(p, "id", None)
+                pname = getattr(p, "name", None)
+            if pid:
+                process_ids.append(str(pid))
+                if pname:
+                    process_names[str(pid)] = str(pname)
         
         job["result"] = {
             "processes": len(state.get("processes", [])),
@@ -324,11 +357,15 @@ async def process_pdf_background(job_id: str):
             "roles": len(state.get("roles", [])),
             "gateways": len(state.get("gateways", [])),
             "decisions": len(state.get("dmn_decisions", [])),
+            "process_ids": process_ids,
+            "process_names": process_names,
             "bpmn_path": bpmn_paths[0] if bpmn_paths else str(Config.OUTPUT_DIR / "process.bpmn"),  # Backward compatibility
             "bpmn_paths": bpmn_paths,  # All BPMN file paths
             "bpmn_files": bpmn_files,  # process_id -> file_path mapping
             "dmn_path": str(Config.OUTPUT_DIR / "decisions.dmn")
         }
+        
+        job["status"] = "completed"
         
         workflow.neo4j.close()
         

@@ -32,6 +32,28 @@ class Config:
     SIMILARITY_REVIEW_THRESHOLD: float = 0.80
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1000"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+    # Upload / file conversion
+    # - If uploaded file is not a PDF, convert to PDF when possible.
+    ENABLE_FILE_CONVERSION: bool = os.getenv("ENABLE_FILE_CONVERSION", "true").lower() == "true"
+    # Preferred converter: libreoffice/soffice. If empty, we try to find on PATH.
+    LIBREOFFICE_PATH: str = os.getenv("LIBREOFFICE_PATH", "")
+
+    # OCR / Vision extraction
+    # - If a PDF page contains images, OCR should run even if text exists.
+    ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() == "true"
+    OCR_ALWAYS_IF_IMAGES: bool = os.getenv("OCR_ALWAYS_IF_IMAGES", "true").lower() == "true"
+    # "tesseract" | "openai_vision" (will fallback automatically if deps unavailable)
+    OCR_ENGINE: str = os.getenv("OCR_ENGINE", "tesseract").lower()
+    OCR_DPI: int = int(os.getenv("OCR_DPI", "200"))
+    # Safety limits
+    OCR_MAX_PAGES: int = int(os.getenv("OCR_MAX_PAGES", "50"))
+    OCR_MAX_IMAGE_PIXELS: int = int(os.getenv("OCR_MAX_IMAGE_PIXELS", str(2000 * 2000)))
+
+    # SOP segmentation (optional but improves multi-process docs)
+    # When enabled and OpenAI key is available, detect SOP boundaries and create sections per SOP.
+    ENABLE_SOP_SEGMENTATION: bool = os.getenv("ENABLE_SOP_SEGMENTATION", "true").lower() == "true"
+    SOP_MAX_PAGES_FOR_BOUNDARY: int = int(os.getenv("SOP_MAX_PAGES_FOR_BOUNDARY", "30"))
     
     # Performance optimization options
     EVIDENCE_MODE: str = os.getenv("EVIDENCE_MODE", "full")  # "full", "reference_only", "off"

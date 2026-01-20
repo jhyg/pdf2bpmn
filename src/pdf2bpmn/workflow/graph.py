@@ -757,16 +757,22 @@ class PDF2BPMNWorkflow:
             if name in seen_names:
                 continue
             
-            # Check for similar existing entities
-            try:
-                match, score, action = self.vector_search.find_similar_entity(
-                    entity_type, entity.name, getattr(entity, 'description', '')
-                )
-                
-                if action == "merge" and match:
-                    continue
-            except:
-                pass
+            # IMPORTANT:
+            # - 이 단계는 "이번 실행에서 추출된 엔티티들" 내부의 중복 제거가 1차 목적입니다.
+            # - 기존 DB(Neo4j)에 이미 유사 엔티티가 있다고 해서 여기서 스킵해버리면,
+            #   해당 실행에서 Task/Role이 0개가 되어 BPMN이 비어버리는 문제가 발생할 수 있습니다.
+            # - 따라서 Task/Role은 벡터서치 기반 'merge => skip'를 적용하지 않습니다.
+            if entity_type not in ("Task", "Role"):
+                # Check for similar existing entities
+                try:
+                    match, score, action = self.vector_search.find_similar_entity(
+                        entity_type, entity.name, getattr(entity, 'description', '')
+                    )
+                    
+                    if action == "merge" and match:
+                        continue
+                except Exception:
+                    pass
             
             seen_names[name] = entity
             unique.append(entity)

@@ -1,7 +1,7 @@
 # PDF2BPMN Docker Image
 # PDF to BPMN Converter with Agent Server
 # 
-# Build: docker build -t ghcr.io/uengine-oss/pdf2bpmn:v0.0.1 .
+# Build: docker build --no-cache -t ghcr.io/uengine-oss/pdf2bpmn:v0.0.1 .
 # Run: docker run -p 8000:8000 -p 8001:8001 --env-file agent.env ghcr.io/uengine-oss/pdf2bpmn:v0.0.1
 
 FROM python:3.11-slim
@@ -20,6 +20,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    # Office → PDF conversion
+    libreoffice \
+    # OCR (Korean + English)
+    tesseract-ocr \
+    tesseract-ocr-kor \
+    # Some libs commonly needed by renderers
+    libglib2.0-0 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements files
@@ -37,6 +45,9 @@ RUN pip install --no-cache-dir \
     openai>=1.0.0 \
     pypdf>=4.0.0 \
     pdfplumber>=0.11.0 \
+    pymupdf>=1.24.0 \
+    pillow>=10.0.0 \
+    pytesseract>=0.3.10 \
     tiktoken>=0.7.0 \
     numpy>=1.26.0 \
     pydantic>=2.0.0 \
@@ -55,6 +66,7 @@ COPY src/ ./src/
 COPY run.py ./
 COPY pdf2bpmn_agent_executor.py ./
 COPY pdf2bpmn_agent_server.py ./
+COPY pdf2bpmn_scaledjob_worker.py ./
 
 # Create necessary directories
 RUN mkdir -p /app/output /app/uploads

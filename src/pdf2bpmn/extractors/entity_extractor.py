@@ -32,7 +32,10 @@ class ExtractedEntities(BaseModel):
 
 
 EXTRACTION_PROMPT = """You are an expert at extracting business process elements from Korean business documents.
+Your goal is to extract ALL relevant process elements from ANY type of business document, regardless of format.
+
 {existing_context}
+
 Analyze the following text and extract:
 1. **Processes**: Business processes or procedures (절차, 업무 흐름, 처리 단계, 프로세스)
 2. **Tasks/Activities**: Individual activities or actions (행위: ~한다, ~해야 한다, 점검, 승인, 검토, 접수, 등록, 통보, 보고)

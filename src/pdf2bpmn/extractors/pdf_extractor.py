@@ -39,11 +39,35 @@ class PDFExtractor:
             
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
+
+                # If the page contains images, always attempt OCR/Vision extraction (configurable).
+                # This is NOT a fallback only when text is empty; images can contain critical tables/steps.
+                if Config.ENABLE_OCR and i < Config.OCR_MAX_PAGES:
+                    try:
+                        has_images = bool(getattr(page, "images", None)) and len(page.images) > 0
+                    except Exception:
+                        has_images = False
+
+                    if has_images and Config.OCR_ALWAYS_IF_IMAGES:
+                        ocr_text = self._extract_text_from_page_image(path, page_index=i)
+                        if ocr_text:
+                            # Merge without exploding duplicates: append unique lines only.
+                            merged = _merge_text_lines(text, ocr_text)
+                            text = merged
                 page_texts[i + 1] = text
                 all_text.append((i + 1, text))
-            
-            # Extract sections (heading detection)
-            sections = self._extract_sections(doc.doc_id, all_text)
+
+            # Extract sections
+            # 1) SOP boundary detection (optional, more robust for manuals/SOP documents)
+            # 2) Fallback to heading detection
+            sections = []
+            if Config.ENABLE_SOP_SEGMENTATION and Config.OPENAI_API_KEY:
+                try:
+                    sections = self._extract_sop_sections(doc.doc_id, page_texts)
+                except Exception:
+                    sections = []
+            if not sections:
+                sections = self._extract_sections(doc.doc_id, all_text)
             
             # Create reference chunks
             if self.chunking_strategy == "semantic":
@@ -52,7 +76,191 @@ class PDFExtractor:
                 chunks = self._create_chunks(doc.doc_id, page_texts)
             
             return doc, sections, chunks
-    
+
+    def _extract_sop_sections(self, doc_id: str, page_texts: dict[int, str]) -> list[Section]:
+        """
+        문서 전체에서 SOP(독립 프로세스) 경계를 LLM으로 식별하고,
+        SOP 단위로 Section을 생성합니다.
+        """
+        # Limit pages for boundary detection
+        pages = sorted(page_texts.keys())[: Config.SOP_MAX_PAGES_FOR_BOUNDARY]
+        joined = "\n\n".join([f"[PAGE {p}]\n{page_texts.get(p, '')}" for p in pages])
+        if not joined.strip():
+            return []
+
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore
+            from langchain_core.prompts import ChatPromptTemplate  # type: ignore
+            from langchain_core.output_parsers import JsonOutputParser  # type: ignore
+            from pydantic import BaseModel, Field  # type: ignore
+        except Exception:
+            return []
+
+        class _SOPBoundary(BaseModel):
+            title: str = Field(...)
+            page_from: int = Field(...)
+            page_to: int = Field(...)
+
+        class _SOPBoundaries(BaseModel):
+            sops: list[_SOPBoundary] = Field(default_factory=list)
+
+        prompt = ChatPromptTemplate.from_template(
+            """당신은 문서 구조 분석 전문가입니다.
+주어진 문서에서 SOP(표준작업절차) 또는 독립적인 업무 프로세스의 경계를 식별해주세요.
+
+규칙:
+- 문서 제목 전체는 SOP가 아닐 수 있습니다. 문서 내부의 구체적인 업무 절차(요청관리, 변경관리, 장애관리 등)를 찾으세요.
+- SOP는 독립적인 시작/끝을 가진 절차 단위입니다.
+- 반환은 최대한 포괄적으로 하되, 과도하게 잘게 쪼개지 마세요.
+
+응답 형식(JSON):
+{{"sops":[{{"title":"SOP 제목","page_from":1,"page_to":3}}]}}
+
+문서 내용:
+{text}
+"""
+        )
+        llm = ChatOpenAI(model=Config.OPENAI_MODEL, api_key=Config.OPENAI_API_KEY, temperature=0)
+        parser = JsonOutputParser(pydantic_object=_SOPBoundaries)
+        chain = prompt | llm | parser
+        data = chain.invoke({"text": joined})
+        boundaries = _SOPBoundaries(**data)
+        if not boundaries.sops:
+            return []
+
+        sections: list[Section] = []
+        for sop in boundaries.sops:
+            pf = max(1, int(sop.page_from))
+            pt = max(pf, int(sop.page_to))
+            content = "\n\n".join([page_texts.get(p, "") for p in range(pf, pt + 1)]).strip()
+            if not content:
+                continue
+            sections.append(
+                Section(
+                    section_id=generate_id(),
+                    doc_id=doc_id,
+                    heading=sop.title.strip() or "SOP",
+                    level=1,
+                    page_from=pf,
+                    page_to=pt,
+                    content=content,
+                )
+            )
+
+        return sections
+
+    def _extract_text_from_page_image(self, pdf_path: Path, page_index: int) -> str:
+        """
+        Render a PDF page to an image and extract text via OCR/Vision.
+        Tries multiple render/OCR backends; always fails gracefully (returns "").
+        """
+        image = None
+
+        # 1) Render via PyMuPDF if available (no external poppler dependency)
+        try:
+            import fitz  # type: ignore
+
+            with fitz.open(str(pdf_path)) as doc:
+                if page_index < 0 or page_index >= doc.page_count:
+                    return ""
+                page = doc.load_page(page_index)
+                zoom = max(1.0, Config.OCR_DPI / 72.0)
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                if pix.width * pix.height > Config.OCR_MAX_IMAGE_PIXELS:
+                    # Downscale if too large
+                    scale = (Config.OCR_MAX_IMAGE_PIXELS / float(pix.width * pix.height)) ** 0.5
+                    mat = fitz.Matrix(zoom * scale, zoom * scale)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                from PIL import Image  # type: ignore
+
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        except Exception:
+            image = None
+
+        # 2) Render via pdfplumber (best-effort)
+        if image is None:
+            try:
+                from PIL import Image  # type: ignore
+                import io
+
+                with pdfplumber.open(pdf_path) as pdf:
+                    if page_index < 0 or page_index >= len(pdf.pages):
+                        return ""
+                    page = pdf.pages[page_index]
+                    page_image = page.to_image(resolution=Config.OCR_DPI)
+                    # page_image.original is a PIL Image in many environments
+                    image = getattr(page_image, "original", None)
+                    if image is None:
+                        # Fallback to bytes if possible
+                        bio = io.BytesIO()
+                        page_image.save(bio, format="PNG")
+                        bio.seek(0)
+                        image = Image.open(bio)
+            except Exception:
+                image = None
+
+        if image is None:
+            return ""
+
+        # OCR engine selection
+        engine = (Config.OCR_ENGINE or "tesseract").lower()
+
+        if engine == "openai_vision":
+            return self._ocr_with_openai_vision(image)
+
+        # Default: tesseract
+        return self._ocr_with_tesseract(image)
+
+    def _ocr_with_tesseract(self, image) -> str:
+        try:
+            import pytesseract  # type: ignore
+        except Exception:
+            return ""
+
+        try:
+            # Korean+English is common for business docs
+            text = pytesseract.image_to_string(image, lang="kor+eng")
+            return (text or "").strip()
+        except Exception:
+            return ""
+
+    def _ocr_with_openai_vision(self, image) -> str:
+        """
+        OCR via OpenAI Vision (multimodal). This is used when Tesseract isn't available or quality is insufficient.
+        """
+        try:
+            import base64
+            import io
+            from langchain_openai import ChatOpenAI  # type: ignore
+            from langchain_core.messages import HumanMessage  # type: ignore
+        except Exception:
+            return ""
+
+        try:
+            buf = io.BytesIO()
+            # Keep PNG for better text clarity
+            image.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+            llm = ChatOpenAI(model=Config.OPENAI_MODEL, api_key=Config.OPENAI_API_KEY, temperature=0)
+            prompt = (
+                "You are an OCR engine. Extract ALL readable Korean/English text from the image. "
+                "Preserve line breaks. Do not add commentary. Output plain text only."
+            )
+            msg = HumanMessage(
+                content=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]
+            )
+            resp = llm.invoke([msg])
+            text = getattr(resp, "content", "") or ""
+            return str(text).strip()
+        except Exception:
+            return ""
+
+
     def _extract_sections(
         self, 
         doc_id: str, 
@@ -297,6 +505,24 @@ class PDFExtractor:
         for chunk in chunks:
             yield chunk
 
+
+def _merge_text_lines(base_text: str, extra_text: str) -> str:
+    """
+    Merge OCR text into extracted text while minimizing obvious duplication.
+    Keeps ordering: base_text first, then any new lines from extra_text.
+    """
+    base_lines = [ln.strip() for ln in (base_text or "").splitlines() if ln.strip()]
+    extra_lines = [ln.strip() for ln in (extra_text or "").splitlines() if ln.strip()]
+    if not extra_lines:
+        return base_text or ""
+
+    seen = set(base_lines)
+    merged = list(base_lines)
+    for ln in extra_lines:
+        if ln not in seen:
+            merged.append(ln)
+            seen.add(ln)
+    return "\n".join(merged).strip()
 
 
 
