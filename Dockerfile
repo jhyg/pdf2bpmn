@@ -22,6 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     # Office → PDF conversion
     libreoffice \
+    ca-certificates \
+    locales \
+    fonts-dejavu \
+    fonts-liberation \
+    fonts-noto-cjk \
+    fonts-nanum \
     # OCR (Korean + English)
     tesseract-ocr \
     tesseract-ocr-kor \
@@ -29,6 +35,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Korean locale (helps some rendering/text handling)
+RUN sed -i 's/^# *ko_KR.UTF-8 UTF-8/ko_KR.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen
+
+ENV LANG=ko_KR.UTF-8 \
+    LC_ALL=ko_KR.UTF-8
 
 # Copy requirements files
 COPY pyproject.toml ./

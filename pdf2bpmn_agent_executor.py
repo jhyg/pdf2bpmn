@@ -283,10 +283,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         # LLM-based assignment controls
         # - ENABLE_LLM_ROLE_MAPPING: allow LLM to suggest best assignee (existing user/agent/team)
-        # - ENABLE_AUTO_AGENT_CREATION: allow creating a NEW agent user and mapping it
         self._enable_llm_role_mapping: bool = os.getenv("ENABLE_LLM_ROLE_MAPPING", "true").lower() == "true"
-        # 요구사항: 에이전트가 필요한 경우 생성되어야 함 → 기본값 true (환경변수로 비활성화 가능)
-        self._enable_auto_agent_creation: bool = os.getenv("ENABLE_AUTO_AGENT_CREATION", "true").lower() == "true"
         self._llm_assignment_min_conf: float = float(os.getenv("LLM_ASSIGNMENT_MIN_CONFIDENCE", "0.72"))
 
         # In-run cache to avoid repeated LLM calls per role name
@@ -971,6 +968,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         process_name: str,
         proc_json: Dict[str, Any],
         forms_result: Dict[str, Any],
+        extracted: Optional[Dict[str, Any]] = None,
         tenant_id: str,
         event_queue: EventQueue,
         context_id: str,
@@ -982,12 +980,17 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         - Ensure agent fields are consistent (agentMode/orchestration)
         - Set inputData using real form_id + fields_json from earlier tasks
         """
-        # 0) Ensure assignment is applied (and agents can be created) once more, now that we are close to saving.
+        # 0) Final-stage assignee mapping:
+        # - Do it AFTER forms exist and process is enriched, so we can use:
+        #   (a) generated process info (activities/roles/tools)
+        #   (b) extracted info (from PDF/Neo4j) if provided
+        #   (c) organization chart + agent profiles
         try:
             await self._apply_assignment_and_maybe_create_agents(
                 proc_json=proc_json,
                 tenant_id=tenant_id,
                 process_name=process_name,
+                extracted=extracted,
             )
         except Exception as e:
             logger.warning(f"[WARN] assignment apply failed in expand stage: {e}")
@@ -1208,43 +1211,104 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         return result
 
-    async def _download_pdf(self, url: str, filename: str = None) -> str:
-        """(deprecated) 파일 다운로드 후 임시 파일 경로 반환"""
+    async def _download_pdf(self, url: str, filename: str = None) -> Tuple[str, str, Optional[str]]:
+        """(deprecated) 파일 다운로드 후 (임시 경로, 추정 파일명, content-type) 반환"""
         return await self._download_file(url, filename)
 
-    async def _download_file(self, url: str, filename: str = None) -> str:
-        """파일 다운로드 후 임시 파일 경로 반환 (PDF/Office/Image 등 모두 지원)"""
+    async def _download_file(self, url: str, filename: str = None) -> Tuple[str, str, Optional[str]]:
+        """
+        파일 다운로드 후 (임시 파일 경로, 추정 파일명, content-type)을 반환합니다.
+        - docx2pdf 프로젝트처럼 Content-Disposition / URL / Content-Type으로 파일명/확장자를 최대한 추정합니다.
+        - 확장자가 불명확하면 `.bin`으로 저장합니다(이 경우 변환이 실패할 수 있음).
+        """
         client = await self._get_http_client()
-        
+
         logger.info(f"[DOWNLOAD] Downloading file from: {url}")
-        
+
         response = await client.get(url, follow_redirects=True)
         if response.status_code != 200:
             raise Exception(f"Failed to download file: {response.status_code}")
-        
-        # 임시 파일 생성
-        suffix = ""
-        if filename:
-            # 파일명에서 확장자 추출
-            p = Path(filename)
-            suffix = p.suffix if p.suffix else ""
-        if not suffix:
-            # URL에서 확장자 추정
+
+        def _sanitize_filename(name: str) -> str:
+            name = (name or "").replace("\\", "/").split("/")[-1]
+            name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
+            name = re.sub(r"\s+", " ", name).strip()
+            return name[:150] if name else ""
+
+        def _guess_filename_from_headers() -> str:
+            cd = response.headers.get("content-disposition") or response.headers.get("Content-Disposition") or ""
+            if cd:
+                m = re.search(r"filename\*=UTF-8''([^;]+)", cd, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        from urllib.parse import unquote
+
+                        v = _sanitize_filename(unquote(m.group(1)))
+                        if v:
+                            return v
+                    except Exception:
+                        pass
+                m = re.search(r'filename="([^"]+)"', cd, flags=re.IGNORECASE)
+                if m:
+                    v = _sanitize_filename(m.group(1))
+                    if v:
+                        return v
+                m = re.search(r"filename=([^;]+)", cd, flags=re.IGNORECASE)
+                if m:
+                    v = _sanitize_filename(m.group(1).strip().strip('"'))
+                    if v:
+                        return v
+
             try:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                suffix = Path(parsed.path).suffix
+                from urllib.parse import urlparse, unquote
+
+                parsed = urlparse(str(response.url))
+                base = _sanitize_filename(unquote(Path(parsed.path).name))
+                if base:
+                    return base
             except Exception:
-                suffix = ""
-        if not suffix:
-            suffix = ".bin"
-        
+                pass
+
+            return ""
+
+        content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower() or None
+        content_type_to_ext = {
+            "application/pdf": ".pdf",
+            "application/msword": ".doc",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/vnd.ms-excel": ".xls",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "application/vnd.ms-powerpoint": ".ppt",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+            "text/plain": ".txt",
+            "text/csv": ".csv",
+            "text/html": ".html",
+            "application/rtf": ".rtf",
+            "application/vnd.oasis.opendocument.text": ".odt",
+            "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+            "application/vnd.oasis.opendocument.presentation": ".odp",
+        }
+
+        inferred_name = _sanitize_filename(filename) if filename else ""
+        if not inferred_name:
+            inferred_name = _guess_filename_from_headers() or "input"
+
+        ext = Path(inferred_name).suffix.lower()
+        body_head = response.content[:6] if response.content else b""
+        is_pdf_by_magic = body_head.startswith(b"%PDF-")
+        if (not ext) or (ext == ".pdf" and (not is_pdf_by_magic) and content_type and content_type != "application/pdf"):
+            mapped = content_type_to_ext.get(content_type or "")
+            if mapped:
+                inferred_name = str(Path(inferred_name).with_suffix(mapped))
+                ext = mapped
+
+        suffix = ext or ".bin"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_file.write(response.content)
         temp_file.close()
-        
-        logger.info(f"[DOWNLOAD] File saved to: {temp_file.name}")
-        return temp_file.name
+
+        logger.info(f"[DOWNLOAD] File saved to: {temp_file.name} (inferred={inferred_name}, ct={content_type})")
+        return temp_file.name, inferred_name, content_type
 
     def _normalize_text_key(self, s: str) -> str:
         return re.sub(r"\s+", "", (s or "").strip().lower())
@@ -1474,20 +1538,34 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         return out[:30]
 
     def _get_user_candidates(self, role_name: str) -> List[Dict[str, Any]]:
-        """역할명에 대해 후보 사용자/에이전트를 가볍게 필터링(LLM 입력 토큰 절약용)."""
+        """역할명에 대해 후보 에이전트(users.is_agent=true)만 가볍게 필터링(LLM 입력 토큰 절약용).
+
+        IMPORTANT:
+        - 후보는 users 테이블에 존재하는 '에이전트'만이어야 한다.
+        - 사람 사용자(is_agent=false)는 후보에 포함하지 않는다.
+        """
         key = self._normalize_text_key(role_name)
         if not key:
             return []
 
         scored: List[tuple[float, Dict[str, Any]]] = []
-        for u in (self._users or []):
+        # Candidate pool is agents only
+        for u in (self._agents or []):
             if not isinstance(u, dict) or not u.get("id"):
                 continue
             uname = self._normalize_text_key(u.get("username")) or ""
             urole = self._normalize_text_key(u.get("role")) or ""
             ualias = self._normalize_text_key(u.get("alias")) or ""
+            # NOTE: LLM이 "태스크 설명 ↔ 에이전트 설명" 매칭을 하려면
+            # 에이전트의 description/goal/persona가 후보로 제공되어야 한다.
+            # (하지만 토큰 절약을 위해 slim 단계에서만 포함/절단한다)
+            udesc = self._normalize_text_key(u.get("description")) or ""
+            ugoal = self._normalize_text_key(u.get("goal")) or ""
+            upersona = self._normalize_text_key(u.get("persona")) or ""
             score = 0.0
-            for cand in (uname, urole, ualias):
+            # 역할명/태스크명은 보통 username/role/alias에 가장 잘 걸리지만,
+            # 최근 생성된 에이전트는 description/goal에만 힌트가 있는 경우가 있어 포함한다.
+            for cand in (uname, urole, ualias, udesc, ugoal, upersona):
                 if not cand:
                     continue
                 if cand == key:
@@ -1502,7 +1580,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         scored.sort(key=lambda x: x[0], reverse=True)
         picked = [u for _, u in scored[:30]]
 
-        # if nothing matched, still provide top agents (helps LLM pick generic assignee)
+        # if nothing matched, do NOT provide unrelated fallback humans; provide top agents only.
         if not picked:
             picked = (self._agents or [])[:20]
         # minimize fields
@@ -1510,14 +1588,29 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         for u in picked:
             if not isinstance(u, dict):
                 continue
+            # LLM이 태스크 설명과 에이전트 설명을 비교할 수 있도록
+            # (특히 에이전트의) 텍스트 프로필 일부를 제공한다.
+            is_agent = True  # pool is agents only
+            desc = str(u.get("description") or "").strip()
+            goal = str(u.get("goal") or "").strip()
+            persona = str(u.get("persona") or "").strip()
+            if len(desc) > 220:
+                desc = desc[:220] + "…"
+            if len(goal) > 180:
+                goal = goal[:180] + "…"
+            if len(persona) > 220:
+                persona = persona[:220] + "…"
             slim.append(
                 {
                     "id": str(u.get("id") or ""),
                     "username": str(u.get("username") or ""),
                     "role": str(u.get("role") or ""),
                     "alias": str(u.get("alias") or ""),
-                    "is_agent": bool(u.get("is_agent") is True),
+                    "is_agent": is_agent,
                     "agent_type": str(u.get("agent_type") or ""),
+                    "description": desc,
+                    "goal": goal,
+                    "persona": persona,
                 }
             )
         return slim[:30]
@@ -2283,7 +2376,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 role_name=rn,
                 activities_context=[],
             )
-            if isinstance(rec, dict) and str(rec.get("action") or "") == "create_agent" and self._enable_auto_agent_creation:
+            if isinstance(rec, dict) and str(rec.get("action") or "") == "create_agent":
                 create_agent = rec.get("create_agent") or {}
                 team_id_for_new = str(create_agent.get("team_id") or rec.get("target_team_id") or "").strip()
                 team_name = self._org_team_name_by_id.get(team_id_for_new) or "미분류"
@@ -2381,20 +2474,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if not self.openai_client:
             return None
 
-        # 1) user mapping first (hints)
-        hints = await self._prepare_assignment_hints_from_extraction(
-            tenant_id=tenant_id,
-            process_name=process_name,
-            extracted=extracted,
-        )
-        hints_simplified = hints.get("simplified") if isinstance(hints, dict) else {}
-
-        # 1.5) (프롬프트 개선) ProcessConsultingGenerator 프롬프트로 "말로 된 프로세스 초안"을 먼저 생성
+        # 1) (프롬프트 개선) ProcessConsultingGenerator 프롬프트로 "말로 된 프로세스 초안"을 먼저 생성
+        # NOTE: 담당자 매핑은 "마지막 확장 단계(after forms)"에서 수행한다.
         consulting_outline = await self._generate_process_outline_via_consulting_prompt(
             process_name=process_name,
             user_request=user_request,
             extracted=extracted,
-            hints_simplified=hints_simplified if isinstance(hints_simplified, dict) else {},
+            hints_simplified={},
         )
 
         # 2) build system prompt (100% identical target: ProcessDefinitionGenerator.js, ProcessGPT mode)
@@ -2414,7 +2500,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         }
         messages = build_process_definition_messages(
             base_system_prompt=system_prompt,
-            hints_simplified=hints_simplified if isinstance(hints_simplified, dict) else {},
+            hints_simplified={},
             consulting_outline=consulting_outline,
             extracted_summary=extracted_summary,
             user_request=user_request,
@@ -2434,22 +2520,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             process_name=str(runtime_def.get("processDefinitionName") or process_name),
             process_definition_id=str(runtime_def.get("processDefinitionId") or elements_model.get("processDefinitionId")),
         )
-        try:
-            await self._apply_assignment_and_maybe_create_agents(
-                proc_json=runtime_def,
-                tenant_id=tenant_id,
-                process_name=str(runtime_def.get("processDefinitionName") or process_name),
-            )
-        except Exception as e:
-            logger.warning(f"[WARN] assignment apply failed (post-process): {e}")
-
-        # (t2) store simplified mapping into runtime definition (for debugging/prompt reuse)
-        try:
-            runtime_def["roleUserMappingSimplified"] = self._simplify_assignment_hints(
-                {"roles": runtime_def.get("roles") or [], "activities": runtime_def.get("activities") or []}
-            )
-        except Exception:
-            runtime_def["roleUserMappingSimplified"] = {"roles": {}, "activities": {}}
+        # NOTE: 담당자/에이전트 매핑은 forms + inputData 확장 이후 마지막 단계에서 수행 후 저장한다.
 
         # 7) Generate BPMN XML in backend (no frontend dependency)
         bpmn_xml = await asyncio.to_thread(
@@ -2469,6 +2540,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         process_name: str,
         role_name: str,
         activities_context: List[Dict[str, Any]],
+        extracted_context: Optional[Dict[str, Any]] = None,
+        allow_create_agent: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """
         LLM으로 역할 담당자(기존 user/agent 또는 팀) 추천.
@@ -2487,10 +2560,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         # role_name can include hard line breaks from PDF OCR; normalize to keep matching stable
         role_name_clean = " ".join(str(role_name or "").split())
-        cache_key = self._normalize_text_key(role_name_clean)
+        # Cache key must include process_name to avoid cross-process leakage
+        cache_key = self._normalize_text_key(f"{process_name}|{role_name_clean}")
         if cache_key and cache_key in self._role_assignment_cache:
             return self._role_assignment_cache.get(cache_key)
 
+        # Candidate agents MUST come from users table (is_agent=true) only.
         candidates_users = self._get_user_candidates(role_name_clean)
         candidates_teams = self._get_org_team_candidates(role_name_clean)
 
@@ -2507,53 +2582,146 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 u = users_by_id.get(str(mid))
                 if not u:
                     continue
+                is_agent = bool(u.get("is_agent") is True)
+                desc = str(u.get("description") or "").strip()
+                goal = str(u.get("goal") or "").strip()
+                persona = str(u.get("persona") or "").strip()
+                if len(desc) > 220:
+                    desc = desc[:220] + "…"
+                if len(goal) > 180:
+                    goal = goal[:180] + "…"
+                if len(persona) > 220:
+                    persona = persona[:220] + "…"
                 mlist.append(
                     {
                         "id": str(u.get("id") or ""),
                         "username": str(u.get("username") or ""),
                         "role": str(u.get("role") or ""),
-                        "is_agent": bool(u.get("is_agent") is True),
+                        "is_agent": is_agent,
                         "agent_type": str(u.get("agent_type") or ""),
                         "alias": str(u.get("alias") or ""),
+                        "description": (desc if is_agent else ""),
+                        "goal": (goal if is_agent else ""),
+                        "persona": (persona if is_agent else ""),
                     }
                 )
             if mlist:
                 team_members[tid] = mlist
 
+        create_agent_rule = (
+            "- 후보 에이전트가 없다면, 자동화 이득이 큰 태스크에 한해 create_agent를 선택하세요(없으면 none).\n"
+            if allow_create_agent
+            else "- IMPORTANT: 이번 호출에서는 create_agent 선택이 금지됩니다. action은 existing_user/team/none 중에서만 선택하세요.\n"
+        )
+
         system_prompt = (
             "당신은 BPM 프로세스 정의에서 '역할(Role)'을 시스템의 실제 담당자(User/Agent) 또는 팀(조직도)으로 매핑하는 전문가입니다.\n"
+            "\n"
+            "당신의 목표는 2가지입니다.\n"
+            "1) 태스크(activities_context)의 설명/지침을 보고, **자동화하면 이득인 경우에만** 에이전트(기존 agent user)를 매핑한다.\n"
+            "2) 이미 조직도/유저 목록에 유사한 agent가 있으면 **반드시 재사용**하고, 중복 에이전트를 새로 만들지 않는다.\n"
+            "\n"
+            "입력 데이터 설명:\n"
+            "- activities_context에는 activityName/instruction/description/tool이 포함됩니다. 이것이 '태스크 설명'입니다.\n"
+            "- users/team_members의 각 항목에는 username/role/alias/description/goal/persona가 포함될 수 있습니다. 이것이 '에이전트 설명'입니다.\n"
+            "\n"
             "중요 규칙:\n"
             "- existing_user/team을 선택하는 경우에는 반드시 제공된 후보 목록(users/teams/team_members) 안에서만 선택해야 합니다.\n"
-            "- create_agent는 후보에 적절한 담당자가 없을 때 선택할 수 있으며, team_id는 비어있어도 됩니다.\n"
-            "- create_agent를 선택하는 경우, 생성될 에이전트는 **너무 단일 태스크 전용으로 쪼개지지 않도록** '중간 정도 범위(상세도 6/10)'로 설계하세요.\n"
-            "  예: '수강 신청 도우미', '수강 관리 도우미', '강의 개설 도우미'처럼 과도하게 세분화하지 말고, 가능하면 '교육/수강 운영 도우미'처럼 관련 업무를 포괄하세요.\n"
-            "- 확신이 낮으면 none을 반환하세요.\n"
-            "- 'create_agent'는 자동화 가능성이 높고(정보수집/검증/정리/작성/조회/계산 등) 에이전트가 수행 가능한 작업일 때만 추천하세요.\n"
-            "- create_agent를 추천하더라도, 실제 생성은 ENABLE_AUTO_AGENT_CREATION 설정에 따라 진행될 수 있습니다.\n"
-            "- 출력은 JSON ONLY 입니다.\n"
+            "- existing_user를 선택할 때는 target_user_id가 **is_agent=true인 사용자**여야 합니다. (사람 사용자 is_agent=false는 선택 금지)\n"
+            "- IMPORTANT: users 후보는 users 테이블의 '에이전트(is_agent=true)'만 포함합니다. 사람 사용자는 후보가 아닙니다.\n"
+            + create_agent_rule
+            + "- 아래 조건 중 하나라도 강하게 해당되면 action=none 으로 두세요(에이전트 미매핑):\n"
+            + "  - 사람이 직접 해야 하는 신청/등록/접수/결제/입금/서명/대면/회의/면담 진행/출석/실물 확인/법적 승인 등\n"
+            + "  - 최종 승인/책임 소재가 중요한 의사결정(정책/권한/결재)으로 자동화가 부적절한 경우\n"
+            + "- 반대로 아래 유형은 자동화 이득이 큰 편이므로, 유사한 agent가 있으면 적극적으로 existing_user를 선택하세요:\n"
+            + "  - 문서/콘텐츠 생성(초안 작성, 퀴즈 생성, 안내문 생성), 요약/정리/분류, 검증/체크리스트, 검색/조회, 채점/스코어링, 결과 취합/리포트\n"
+            + "- 에이전트 매칭은 반드시 **태스크 설명 ↔ 에이전트 설명**을 비교해 수행하세요.\n"
+            + "  - (나쁜 매칭) 공통 키워드 1~2개(예: '평가')만으로 선택\n"
+            + "  - (좋은 매칭) '사전평가/퀴즈/문항'처럼 구체 업무가 겹치고, agent 설명에도 같은 업무가 명시됨\n"
+            + "- create_agent는 정말 최후의 수단입니다.\n"
+            + "  - activities_context가 자동화 이득이 크고,\n"
+            + "  - users/team_members 후보 중 어떤 agent도 태스크를 제대로 커버하지 못할 때만 선택하세요.\n"
+            + "  - 유사 agent가 존재한다면(이름/역할/설명에서 업무가 겹친다면) **절대 create_agent를 선택하지 마세요.**\n"
+            + "- create_agent를 선택하는 경우에도 생성될 에이전트는 **너무 단일 태스크 전용으로 쪼개지지 않도록** '중간 정도 범위(상세도 6/10)'로 설계하세요.\n"
+            + "\n"
+            + "예시(반드시 이런 방향으로 판단):\n"
+            + "1) 태스크: '사전 평가 생성' / 설명: '사전평가 퀴즈 문항을 생성하고 난이도/정답을 검증'\n"
+            + "   - 기존 agent 후보에 '사전평가 퀴즈 메이커'가 있으면 => action=existing_user (그 agent)\n"
+            + "   - '강의 평가 봇'처럼 '평가'만 겹치는 agent는 선택하지 않음\n"
+            + "2) 태스크: '인터뷰 검증' / 설명: '면접 질문/답변을 기준에 따라 검증하고 리포트 생성'\n"
+            + "   - 기존 agent 후보에 '인터뷰 검증 에이전트'가 있으면 => action=existing_user (그 agent)\n"
+            + "3) 태스크: '수강 신청' / 설명: '수강자가 직접 신청서를 제출하고 승인 대기'\n"
+            + "   - 자동화(대리 신청)는 부적절 => action=none\n"
+            + "\n"
+            + "- 확신이 낮으면 none을 반환하세요.\n"
+            + "- 출력은 JSON ONLY 입니다.\n"
         )
+
+        def _brief_extracted_for_prompt(ex: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            """LLM 입력 토큰을 과도하게 늘리지 않도록 extracted를 간단 요약."""
+            if not isinstance(ex, dict):
+                return {}
+
+            def _brief_list(items: Any, *, keys: List[str], limit: int) -> List[Dict[str, Any]]:
+                if not isinstance(items, list):
+                    return []
+                out: List[Dict[str, Any]] = []
+                for it in items[: max(0, int(limit))]:
+                    if not isinstance(it, dict):
+                        continue
+                    row: Dict[str, Any] = {}
+                    for k in keys:
+                        v = it.get(k)
+                        if v is None:
+                            continue
+                        # keep compact strings only
+                        if isinstance(v, str):
+                            v = v.strip()
+                            if len(v) > 240:
+                                v = v[:240] + "…"
+                        row[k] = v
+                    if row:
+                        out.append(row)
+                return out
+
+            return {
+                "process": ex.get("process") if isinstance(ex.get("process"), dict) else {},
+                "roles": _brief_list(ex.get("roles"), keys=["name", "role_name", "description"], limit=30),
+                "tasks": _brief_list(ex.get("tasks") or ex.get("activities"), keys=["id", "task_id", "name", "role", "role_name", "description", "instruction"], limit=50),
+                "events": _brief_list(ex.get("events"), keys=["id", "name", "eventType", "description"], limit=20),
+                "gateways": _brief_list(ex.get("gateways"), keys=["id", "name", "gatewayType", "description"], limit=20),
+                "sequence_flows": _brief_list(ex.get("sequence_flows") or ex.get("flows"), keys=["source", "target", "condition"], limit=60),
+            }
 
         user_prompt = (
             f"테넌트: {tenant_id}\n"
             f"프로세스: {process_name}\n"
             f"매핑할 역할명: {role_name_clean}\n\n"
             f"이 역할이 수행하는 태스크 컨텍스트(요약):\n{json.dumps(activities_context[:15], ensure_ascii=False)}\n\n"
-            f"users 후보(최대 30, agents 포함):\n{json.dumps(candidates_users, ensure_ascii=False)}\n\n"
-            f"teams 후보(최대 30):\n{json.dumps(candidates_teams, ensure_ascii=False)}\n\n"
-            f"team_members(팀별 멤버/에이전트 후보, 없을 수 있음):\n{json.dumps(team_members, ensure_ascii=False)}\n\n"
-            "다음 JSON 형식으로만 응답하세요:\n"
-            "{\n"
-            '  "action": "existing_user" | "team" | "create_agent" | "none",\n'
-            '  "target_user_id": "existing_user일 때만. users 후보의 id",\n'
-            '  "target_team_id": "team/create_agent일 때 권장. teams 후보의 team_id (없으면 빈 문자열 가능)",\n'
-            '  "confidence": 0.0,  // 0~1 숫자 (반드시 숫자)\n'
-            '  "reason": "한두 문장 근거",\n'
-            '  "create_agent": {\n'
-            '    "team_id": "생성 에이전트를 소속시킬 team_id (가능하면, 없으면 빈 문자열)",\n'
-            '    "user_input": "OrganizationAgentGenerator에 넣을 사용자 요구사항(한국어, 3~6문장). 단일 태스크 전용이 아니라 관련 업무를 포괄하는 중간 범위(6/10)로 작성",\n'
-            '    "agent_type": "agent" \n'
-            '  }\n'
-            "}\n"
+            + (
+                (
+                    "추출된 원문/Neo4j 정보(요약, 참고용):\n"
+                    f"{json.dumps(_brief_extracted_for_prompt(extracted_context), ensure_ascii=False)}\n\n"
+                )
+                if isinstance(extracted_context, dict)
+                else ""
+            )
+            + f"users 후보(최대 30, agents 포함):\n{json.dumps(candidates_users, ensure_ascii=False)}\n\n"
+            + f"teams 후보(최대 30):\n{json.dumps(candidates_teams, ensure_ascii=False)}\n\n"
+            + f"team_members(팀별 멤버/에이전트 후보, 없을 수 있음):\n{json.dumps(team_members, ensure_ascii=False)}\n\n"
+            + "다음 JSON 형식으로만 응답하세요:\n"
+            + "{\n"
+            + '  "action": "existing_user" | "team" | "create_agent" | "none",\n'
+            + '  "target_user_id": "existing_user일 때만. users 후보의 id",\n'
+            + '  "target_team_id": "team/create_agent일 때 권장. teams 후보의 team_id (없으면 빈 문자열 가능)",\n'
+            + '  "confidence": 0.0,  // 0~1 숫자 (반드시 숫자)\n'
+            + '  "reason": "한두 문장 근거",\n'
+            + '  "create_agent": {\n'
+            + '    "team_id": "생성 에이전트를 소속시킬 team_id (가능하면, 없으면 빈 문자열)",\n'
+            + '    "user_input": "OrganizationAgentGenerator에 넣을 사용자 요구사항(한국어, 3~6문장). 단일 태스크 전용이 아니라 관련 업무를 포괄하는 중간 범위(6/10)로 작성",\n'
+            + '    "agent_type": "agent" \n'
+            + "  }\n"
+            + "}\n"
         )
 
         logger.info(
@@ -2568,6 +2736,98 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         )
         if not isinstance(obj, dict):
             return None
+
+        def _is_agent_user_id_local(user_id: str) -> bool:
+            u = users_by_id.get(str(user_id) or "")
+            return bool(u and u.get("is_agent") is True and u.get("id"))
+
+        def _looks_automatable_from_ctx(ctx: List[Dict[str, Any]]) -> bool:
+            """activities_context 기반으로 '자동화 가치'가 있는지 매우 가볍게 판단(폴백용)."""
+            if not isinstance(ctx, list) or not ctx:
+                return False
+            text = " ".join(
+                [
+                    str(x.get("activityName") or "")
+                    + " "
+                    + str(x.get("instruction") or "")
+                    + " "
+                    + str(x.get("description") or "")
+                    for x in ctx[:8]
+                    if isinstance(x, dict)
+                ]
+            )
+            key = self._normalize_text_key(text)
+            if not key:
+                return False
+            human_kws = [
+                "신청", "등록", "접수", "제출", "결재", "결제", "입금", "납부", "승인", "서명",
+                "대면", "회의", "면담", "전화", "방문", "출석", "참석", "수령", "발급", "실물", "현장",
+            ]
+            auto_kws = [
+                "자동", "에이전트", "봇", "생성", "요약", "정리", "분석", "검증", "추출", "조회", "검색",
+                "분류", "추천", "채점", "퀴즈", "문항", "리포트", "보고서", "취합", "집계",
+            ]
+            if any(self._normalize_text_key(k) in key for k in human_kws):
+                # if explicit automation hint exists, allow it
+                return any(self._normalize_text_key(k) in key for k in auto_kws)
+            return any(self._normalize_text_key(k) in key for k in auto_kws)
+
+        # Post-validate against provided candidates to prevent hallucinated assignments.
+        # - If model says existing_user but provides an invalid/unknown id, force action=none.
+        # - Same for team id.
+        action_raw = str(obj.get("action") or "").strip()
+        cand_user_ids = {str(u.get("id")) for u in (candidates_users or []) if isinstance(u, dict) and u.get("id")}
+        cand_team_ids = {str(t.get("team_id")) for t in (candidates_teams or []) if isinstance(t, dict) and t.get("team_id")}
+
+        if action_raw == "existing_user":
+            target_user_id = str(obj.get("target_user_id") or "").strip()
+            invalid = (not target_user_id) or (cand_user_ids and target_user_id not in cand_user_ids) or (not _is_agent_user_id_local(target_user_id))
+            if invalid:
+                # If no suitable candidate agent exists, and task looks automatable, prefer create_agent.
+                if allow_create_agent and (not cand_user_ids) and _looks_automatable_from_ctx(activities_context):
+                    obj["action"] = "create_agent"
+                    obj["target_user_id"] = ""
+                    obj["target_team_id"] = ""
+                    ca = obj.get("create_agent") if isinstance(obj.get("create_agent"), dict) else {}
+                    if not isinstance(ca, dict):
+                        ca = {}
+                    ca.setdefault("team_id", "")
+                    ca.setdefault(
+                        "user_input",
+                        (
+                            "다음 업무를 자동화할 에이전트를 생성해주세요.\n"
+                            f"- 프로세스: {process_name}\n"
+                            f"- 역할/컨텍스트: {role_name_clean}\n"
+                            f"- 태스크: {json.dumps(activities_context[:3], ensure_ascii=False)}\n"
+                            "사용자에게 필요한 입력이 있으면 확인을 요청하고, 결과를 정리/검증해 주세요."
+                        ),
+                    )
+                    ca.setdefault("agent_type", "agent")
+                    obj["create_agent"] = ca
+                    obj["reason"] = (
+                        "후보 에이전트(users.is_agent=true) 중 적절한 대상이 없어, 자동화 가치가 있는 태스크로 판단되어 create_agent로 전환했습니다."
+                    )
+                else:
+                    obj["action"] = "none"
+                    obj["target_user_id"] = ""
+                    obj["target_team_id"] = ""
+                    obj["reason"] = (
+                        "existing_user로 매핑하려 했으나 target_user_id가 후보(agents)에 없거나 유효하지 않아 미매핑(none) 처리했습니다."
+                    )
+        elif action_raw == "team":
+            target_team_id = str(obj.get("target_team_id") or "").strip()
+            if (not target_team_id) or (cand_team_ids and target_team_id not in cand_team_ids):
+                obj["action"] = "none"
+                obj["target_team_id"] = ""
+                obj["confidence"] = float(obj.get("confidence") or 0.0) if str(obj.get("confidence") or "").strip() else 0.0
+                obj["reason"] = "team으로 매핑하려 했으나 target_team_id가 후보(teams)에 없어 미매핑(none) 처리했습니다."
+
+        # If create_agent is not allowed in this call, force it to none.
+        if not allow_create_agent and str(obj.get("action") or "") == "create_agent":
+            obj["action"] = "none"
+            obj["target_user_id"] = ""
+            obj["target_team_id"] = ""
+            obj["reason"] = "human_required 태스크이므로 신규 에이전트 생성(create_agent)은 금지되어 미매핑(none) 처리했습니다."
 
         # basic validation + threshold
         conf = obj.get("confidence")
@@ -2588,6 +2848,193 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         if cache_key:
             self._role_assignment_cache[cache_key] = obj
+        return obj
+
+    async def _llm_plan_assignments_for_process(
+        self,
+        *,
+        tenant_id: str,
+        process_name: str,
+        proc_json: Dict[str, Any],
+        extracted_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        프로세스 "단건" 맥락으로 자동화 가능 여부 + 담당자(에이전트) 매핑/생성 계획을 한번에 수립합니다.
+
+        목표:
+        - 태스크별로 "자동화 불가/부분 자동화/자동화 가능"을 판단
+        - 자동화(부분 자동화 포함) 가치가 있으면:
+          1) users 테이블에 존재하는 에이전트(is_agent=true) 중 적합한 것을 매핑(existing_user)
+          2) 없으면 create_agent로 신규 생성 계획을 제안
+        - 자동화 불가(사람의 의사/행동이 필수)면 none
+
+        반환(JSON):
+        {
+          "decisions": [
+            {
+              "activity_id": "...",
+              "automation": "none" | "partial" | "full",
+              "action": "existing_user" | "create_agent" | "none",
+              "target_user_id": "",
+              "confidence": 0.0,
+              "reason": "...",
+              "create_agent": { "team_id": "", "user_input": "...", "agent_type": "agent" }
+            }
+          ]
+        }
+        """
+        if not (self._enable_llm_role_mapping and self.openai_client and self.openai_api_key):
+            return None
+        if not isinstance(proc_json, dict):
+            return None
+
+        activities = proc_json.get("activities") or []
+        sequences = proc_json.get("sequences") or []
+        if not isinstance(activities, list):
+            activities = []
+        if not isinstance(sequences, list):
+            sequences = []
+
+        # Candidate agents MUST come from users table (is_agent=true) only.
+        agents_payload: List[Dict[str, Any]] = []
+        for a in (self._agents or [])[:80]:
+            if not isinstance(a, dict) or not a.get("id"):
+                continue
+            # keep compact text fields
+            desc = str(a.get("description") or "").strip()
+            goal = str(a.get("goal") or "").strip()
+            persona = str(a.get("persona") or "").strip()
+            if len(desc) > 220:
+                desc = desc[:220] + "…"
+            if len(goal) > 180:
+                goal = goal[:180] + "…"
+            if len(persona) > 220:
+                persona = persona[:220] + "…"
+            agents_payload.append(
+                {
+                    "id": str(a.get("id") or ""),
+                    "username": str(a.get("username") or ""),
+                    "role": str(a.get("role") or ""),
+                    "alias": str(a.get("alias") or ""),
+                    "description": desc,
+                    "goal": goal,
+                    "persona": persona,
+                    "agent_type": str(a.get("agent_type") or ""),
+                }
+            )
+
+        tasks_payload: List[Dict[str, Any]] = []
+        for t in activities[:200]:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("id") or "").strip()
+            if not tid:
+                continue
+            tasks_payload.append(
+                {
+                    "id": tid,
+                    "name": str(t.get("name") or ""),
+                    "role": str(t.get("role") or ""),
+                    "description": str(t.get("description") or ""),
+                    "instruction": str(t.get("instruction") or ""),
+                    "tool": str(t.get("tool") or ""),
+                }
+            )
+
+        flows_payload: List[Dict[str, Any]] = []
+        for s in sequences[:250]:
+            if not isinstance(s, dict):
+                continue
+            flows_payload.append(
+                {
+                    "source": str(s.get("source") or ""),
+                    "target": str(s.get("target") or ""),
+                    "condition": str(s.get("condition") or ""),
+                }
+            )
+
+        # small extracted summary (reuse helper from _llm_recommend_assignee via local copy)
+        def _brief_extracted(ex: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            if not isinstance(ex, dict):
+                return {}
+            # keep only the essentials for automation judgment
+            out: Dict[str, Any] = {}
+            for k in ("process",):
+                if isinstance(ex.get(k), dict):
+                    out[k] = ex.get(k)
+            for k in ("roles", "tasks", "activities"):
+                v = ex.get(k)
+                if isinstance(v, list):
+                    out[k] = v[:40]
+            return out
+
+        system_prompt = (
+            "당신은 '생성된 특정 프로세스(단건)'를 보고, 각 태스크를 자동화할지/말지와 담당 에이전트 매핑을 설계하는 전문가입니다.\n"
+            "\n"
+            "핵심 원칙(중요):\n"
+            "1) 이 판단은 '이 프로세스 단건'의 맥락으로만 하세요. 넓게 일반화하지 마세요.\n"
+            "2) 자동화는 '풀 자동화' 뿐 아니라 '부분 자동화(검증/채점/정리/초안)'도 포함합니다.\n"
+            "3) people must do:\n"
+            "   - 사람이 '의사/선호'를 결정해야 하는 선택(예: 어떤 강의를 듣고 싶은지 선택) 또는\n"
+            "   - 학생/신청자가 직접 수행해야 하는 행위(예: 퀴즈 풀이/답변 제출)\n"
+            "   => 이런 태스크는 automation=none, action=none\n"
+            "4) 자동화(부분 자동화 포함)가 유의미하면 담당 에이전트를 붙입니다:\n"
+            "   - 먼저, 후보 에이전트(agents 목록: users.is_agent=true) 중에서 적합한 것을 existing_user로 선택\n"
+            "   - 적합한 에이전트가 없으면 create_agent로 신규 생성 계획을 세움\n"
+            "5) existing_user를 선택할 때는 반드시 agents 후보 목록의 id만 쓸 수 있습니다(목록 밖 선택 금지).\n"
+            "\n"
+            "수강신청 프로세스 예시 기준(참고):\n"
+            "- 수강 신청: 사람이 어떤 강의를 듣고 싶은지 정하고 신청 => 자동화 불가\n"
+            "- 사전평가 생성: 기준에 따라 퀴즈 문항 생성/검증 가능 + '사전평가 퀴즈메이커'가 있으면 매핑\n"
+            "- 인터뷰 진행: 학생이 직접 퀴즈 풀이/답변 제출 => 자동화 불가\n"
+            "- 인터뷰 검토: 사람이 최종 검토하되 정답/오답 검증/채점/요약은 자동화 가능 + '인터뷰 검토 에이전트'가 있으면 매핑\n"
+            "- 승인 여부 결정: 기준(점수/조건)으로 자동 승인/반려 가능하면 자동화 가능. 에이전트가 없으면 생성\n"
+            "\n"
+            "출력은 JSON ONLY 입니다.\n"
+        )
+
+        user_prompt = (
+            f"테넌트: {tenant_id}\n"
+            f"프로세스명: {process_name}\n\n"
+            f"프로세스 정의(태스크 목록):\n{json.dumps(tasks_payload, ensure_ascii=False)}\n\n"
+            f"프로세스 흐름(시퀀스):\n{json.dumps(flows_payload, ensure_ascii=False)}\n\n"
+            f"후보 에이전트 목록(users.is_agent=true):\n{json.dumps(agents_payload, ensure_ascii=False)}\n\n"
+            + (
+                f"추출된 원문/Neo4j 정보(요약):\n{json.dumps(_brief_extracted(extracted_context), ensure_ascii=False)}\n\n"
+                if isinstance(extracted_context, dict)
+                else ""
+            )
+            + "다음 형식으로만 응답하세요:\n"
+            + "{\n"
+            + '  "decisions": [\n'
+            + '    {\n'
+            + '      "activity_id": "tasks.id 중 하나",\n'
+            + '      "automation": "none" | "partial" | "full",\n'
+            + '      "action": "existing_user" | "create_agent" | "none",\n'
+            + '      "target_user_id": "action=existing_user일 때만, agents 후보의 id",\n'
+            + '      "confidence": 0.0,\n'
+            + '      "reason": "한두 문장 근거",\n'
+            + '      "create_agent": {\n'
+            + '        "team_id": "",\n'
+            + '        "user_input": "새 에이전트 생성 요구사항(한국어, 3~6문장). 해당 태스크의 자동화 기준/입력/출력/검증을 포함",\n'
+            + '        "agent_type": "agent"\n'
+            + "      }\n"
+            + "    }\n"
+            + "  ]\n"
+            + "}\n"
+        )
+
+        obj = await self._call_openai_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=int(os.getenv("LLM_ASSIGNMENT_PROCESS_MAX_TOKENS", "1400")),
+            model=self.user_mapping_model,
+            temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")),
+        )
+        if not isinstance(obj, dict):
+            return None
+        if not isinstance(obj.get("decisions"), list):
+            return None
         return obj
 
     async def _llm_generate_agent_profile(
@@ -2818,6 +3265,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         proc_json: Dict[str, Any],
         tenant_id: str,
         process_name: str,
+        extracted: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         proc_json.roles / proc_json.activities에 대해:
@@ -2833,6 +3281,120 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if not isinstance(activities, list):
             activities = []
 
+        # -------------------------------------------------------------------
+        # NEW (요구사항): 프로세스 "단건" 맥락에서 자동화 가능 부분을 판단하고
+        # - 기존 에이전트 매핑
+        # - 없으면 생성(create_agent)까지
+        # 를 한 번에 계획/적용한다. (키워드 기반 human_required는 폴백으로만 남김)
+        # -------------------------------------------------------------------
+        plan = await self._llm_plan_assignments_for_process(
+            tenant_id=tenant_id,
+            process_name=process_name,
+            proc_json=proc_json,
+            extracted_context=extracted,
+        )
+
+        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
+
+        def _clean_text(s: Any) -> str:
+            return " ".join(str(s or "").split())
+
+        def _is_agent_user_id(user_id: str) -> bool:
+            u = users_by_id.get(str(user_id) or "")
+            return bool(u and u.get("is_agent") is True and u.get("id"))
+
+        default_agent_mode = "draft"  # fixed
+
+        if isinstance(plan, dict) and isinstance(plan.get("decisions"), list):
+            decisions = plan.get("decisions") or []
+            by_aid: Dict[str, Dict[str, Any]] = {}
+            for d in decisions:
+                if isinstance(d, dict):
+                    aid = str(d.get("activity_id") or "").strip()
+                    if aid:
+                        by_aid[aid] = d
+
+            for a in activities:
+                if not isinstance(a, dict):
+                    continue
+                aid = _clean_text(a.get("id"))
+                aname = _clean_text(a.get("name"))
+                rn = _clean_text(a.get("role"))
+
+                d = by_aid.get(aid)
+                if not isinstance(d, dict):
+                    # no decision => leave unassigned (fallback later)
+                    continue
+
+                action = str(d.get("action") or "none").strip()
+                conf = d.get("confidence")
+                reason = str(d.get("reason") or "")[:200]
+
+                if action == "existing_user":
+                    target_user_id = str(d.get("target_user_id") or "").strip()
+                    if target_user_id and _is_agent_user_id(target_user_id):
+                        a["agent"] = target_user_id
+                        a["agentMode"] = default_agent_mode
+                        a["orchestration"] = "crewai-action"
+                        logger.info(
+                            f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user id={target_user_id!r} conf={conf} reason={reason!r}"
+                        )
+                        continue
+                    # invalid => treat as none
+                    action = "none"
+
+                if action == "create_agent":
+                    create_agent = d.get("create_agent") or {}
+                    if not isinstance(create_agent, dict):
+                        create_agent = {}
+                    team_id_for_new = str(create_agent.get("team_id") or "").strip()
+                    team_name = self._org_team_name_by_id.get(team_id_for_new) or ""
+                    if not team_name:
+                        team_name = "미분류"
+                    user_input = str(create_agent.get("user_input") or "").strip()
+                    if not user_input:
+                        user_input = (
+                            f"다음 태스크를 자동화할 에이전트를 생성해주세요.\n"
+                            f"- 프로세스: {process_name}\n"
+                            f"- 역할: {rn}\n"
+                            f"- 태스크: {aname}\n"
+                            f"- 지침: {_clean_text(a.get('instruction'))}\n"
+                            "자동화 기준/입력/출력/검증 방법을 포함해 설계해 주세요."
+                        )
+                    mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
+                    agent_profile = await self._llm_generate_agent_profile(team_name=team_name, user_input=user_input, mcp_tools=mcp_tools)
+                    if agent_profile:
+                        new_agent_type = str(create_agent.get("agent_type") or "agent").strip() or "agent"
+                        created = await self._insert_agent_user(tenant_id=tenant_id, agent_profile=agent_profile, agent_type=new_agent_type)
+                        if created and created.get("id"):
+                            if team_id_for_new:
+                                await self._update_org_chart_add_member(
+                                    tenant_id=tenant_id, team_id=team_id_for_new, member_user=created
+                                )
+                            a["agent"] = created.get("id")
+                            a["agentMode"] = default_agent_mode
+                            a["orchestration"] = "crewai-action"
+                            logger.info(
+                                f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> create_agent id={created.get('id')!r} conf={conf} reason={reason!r}"
+                            )
+                            continue
+                    # creation failed => none
+                    action = "none"
+
+                # none/default
+                a["agent"] = None
+                a["agentMode"] = "none"
+                a["orchestration"] = None
+                logger.info(
+                    f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> none conf={conf} reason={reason!r}"
+                )
+
+            proc_json["activities"] = activities
+            return
+
+        # -------------------------------------------------------------------
+        # Fallback (legacy): per-activity heuristics + LLM
+        # -------------------------------------------------------------------
         # Build per-role activity context (LLM 입력으로 활용)
         role_ctx: Dict[str, List[Dict[str, Any]]] = {}
         for a in activities:
@@ -2858,23 +3420,45 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # - 역할명이 추상적이거나(신청자 등) 역할만으로는 판단이 어려운 경우에도
         #   activity name/instruction/tool 컨텍스트로 매핑/생성을 시도한다.
         # -------------------------------------------------------------------
-        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
+        # users_by_id/_clean_text/_is_agent_user_id/default_agent_mode already defined above
 
-        def _clean_text(s: Any) -> str:
-            return " ".join(str(s or "").split())
+        # 사람이 직접 수행해야 하는 태스크를 매우 보수적으로 걸러서
+        # "모든 태스크에 에이전트가 붙는" 현상을 방지한다.
+        # (LLM 프롬프트에도 동일 규칙이 있지만, 휴리스틱이 먼저 붙이는 케이스를 막기 위함)
+        _HUMAN_REQUIRED_KWS = [
+            "신청", "등록", "접수", "제출", "결재", "결제", "입금", "납부", "승인", "서명",
+            "대면", "회의", "면담", "전화", "방문", "출석", "참석", "수령", "발급", "실물", "현장",
+        ]
+        _AUTOMATION_HINT_KWS = [
+            # NOTE: "작성"은 신청/제출 같은 인간업무에도 자주 등장하므로 자동화 힌트로 쓰지 않는다.
+            "자동", "에이전트", "봇", "생성", "요약", "정리", "분석", "검증", "추출", "조회", "검색",
+            "분류", "추천", "채점", "퀴즈", "문항", "리포트", "보고서", "취합", "집계",
+        ]
 
-        def _is_agent_user_id(user_id: str) -> bool:
-            u = users_by_id.get(str(user_id) or "")
-            return bool(u and u.get("is_agent") is True and u.get("id"))
+        def _looks_strongly_human_required(activity: Dict[str, Any]) -> bool:
+            text = f"{activity.get('name') or ''} {activity.get('instruction') or ''} {activity.get('description') or ''}"
+            key = self._normalize_text_key(text)
+            if not key:
+                return False
+            # 자동화 힌트가 있으면 사람 업무로 단정하지 않는다(예: '신청서 자동 작성')
+            for kw in _AUTOMATION_HINT_KWS:
+                if self._normalize_text_key(kw) in key:
+                    return False
+            return any(self._normalize_text_key(kw) in key for kw in _HUMAN_REQUIRED_KWS)
 
-        def _heuristic_pick_agent(activity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            # 1) match by role name (agent first)
-            rn = _clean_text(activity.get("role"))
-            if rn:
-                hit = self._pick_user_for_role(rn)
-                if hit and hit.get("is_agent") is True:
-                    return hit
-            # 2) match by activity name/instruction keywords vs agent username/role/alias
+        def _heuristic_pick_agent(activity: Dict[str, Any], *, allow_on_human_required: bool = False) -> Optional[Dict[str, Any]]:
+            human_required = _looks_strongly_human_required(activity)
+            if human_required and not allow_on_human_required:
+                return None
+            # IMPORTANT:
+            # - human_required 태스크에서는 role명(팀/신청자 등)으로 매칭하면 오탐이 많으므로 role 기반 매칭을 건너뛴다.
+            if not human_required:
+                rn = _clean_text(activity.get("role"))
+                if rn:
+                    hit = self._pick_user_for_role(rn)
+                    if hit and hit.get("is_agent") is True:
+                        return hit
+            # match by activity name/instruction/description keywords vs agent username/role/alias
             key = self._normalize_text_key(f"{activity.get('name') or ''} {activity.get('instruction') or ''} {activity.get('description') or ''}")
             if not key:
                 return None
@@ -2901,8 +3485,53 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 a["orchestration"] = "crewai-action"
                 continue
 
+            human_required = _looks_strongly_human_required(a)
+            # human_required: 신규 생성은 금지하되, 기존에 조직도/users에 있는 적절한 에이전트는 찾아서 매핑할 수 있어야 한다.
+            if human_required:
+                hit = _heuristic_pick_agent(a, allow_on_human_required=True)
+                if hit and hit.get("id"):
+                    a["agent"] = hit.get("id")
+                    a["agentMode"] = default_agent_mode
+                    a["orchestration"] = "crewai-action"
+                    logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent(human_required) id={hit.get('id')}")
+                    continue
+                # LLM may still find a better existing agent, but MUST NOT create a new one for human_required tasks.
+                activity_ctx = [
+                    {
+                        "activityId": aid,
+                        "activityName": aname,
+                        "role": rn,
+                        "instruction": _clean_text(a.get("instruction")),
+                        "description": _clean_text(a.get("description")),
+                        "tool": _clean_text(a.get("tool")),
+                    }
+                ]
+                role_query = _clean_text(f"{rn} {aname} {a.get('instruction') or ''} {a.get('description') or ''}") or aid
+                rec = await self._llm_recommend_assignee(
+                    tenant_id=tenant_id,
+                    process_name=process_name,
+                    role_name=role_query,
+                    activities_context=activity_ctx,
+                    extracted_context=extracted,
+                    allow_create_agent=False,
+                )
+                if isinstance(rec, dict) and str(rec.get("action") or "") == "existing_user":
+                    target_user_id = str(rec.get("target_user_id") or "").strip()
+                    if target_user_id and _is_agent_user_id(target_user_id):
+                        a["agent"] = target_user_id
+                        a["agentMode"] = default_agent_mode
+                        a["orchestration"] = "crewai-action"
+                        logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user(human_required) id={target_user_id}")
+                        continue
+                # default: keep unassigned (no creation)
+                a["agent"] = None
+                a["agentMode"] = "none"
+                a["orchestration"] = None
+                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> human_required => no agent (creation disabled)")
+                continue
+
             # heuristic pick first
-            hit = _heuristic_pick_agent(a)
+            hit = _heuristic_pick_agent(a, allow_on_human_required=False)
             if hit and hit.get("id"):
                 a["agent"] = hit.get("id")
                 a["agentMode"] = default_agent_mode
@@ -2929,6 +3558,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 process_name=process_name,
                 role_name=role_query,
                 activities_context=activity_ctx,
+                extracted_context=extracted,
+                allow_create_agent=True,
             )
             if not isinstance(rec, dict):
                 a["agent"] = None
@@ -2937,8 +3568,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 continue
 
             action = str(rec.get("action") or "none").strip()
+            target_uid_dbg = str(rec.get("target_user_id") or "").strip()
+            target_tid_dbg = str(rec.get("target_team_id") or "").strip()
             logger.info(
-                f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} LLM action={action} conf={rec.get('confidence')} reason={str(rec.get('reason') or '')[:120]!r}"
+                f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} "
+                f"LLM action={action} target_user_id={target_uid_dbg!r} target_team_id={target_tid_dbg!r} "
+                f"conf={rec.get('confidence')} reason={str(rec.get('reason') or '')[:120]!r}"
             )
 
             if action == "existing_user":
@@ -2949,7 +3584,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     a["orchestration"] = "crewai-action"
                     continue
 
-            if action == "create_agent" and self._enable_auto_agent_creation:
+            if action == "create_agent":
                 create_agent = rec.get("create_agent") or {}
                 if not isinstance(create_agent, dict):
                     create_agent = {}
@@ -3537,7 +4172,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         logger.info(f"[START] PDF2BPMN task: {user_input[:100] if user_input else 'N/A'}... (job_id: {job_id})")
         
-        temp_pdf_path = None
+        temp_download_path: Optional[str] = None
+        temp_pdf_path: Optional[str] = None
         
         try:
             # 2. 작업 시작 이벤트
@@ -3621,18 +4257,101 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
-                f"[UPLOAD] PDF 파일을 분석 서버에 업로드 중: {pdf_name}",
+                f"[DOWNLOAD] 파일 다운로드 중: {pdf_name}",
+                "tool_usage_started", 8
+            )
+
+            # 파일 다운로드(헤더/URL/Content-Type 기반 파일명 추정 포함)
+            temp_download_path, inferred_name, inferred_ct = await self._download_file(pdf_url, pdf_name)
+            pdf_name = inferred_name or pdf_name
+
+            # PDF 여부 판별(확장자보다 매직바이트 우선)
+            is_pdf = False
+            try:
+                with open(temp_download_path, "rb") as _f:
+                    is_pdf = (_f.read(6) or b"").startswith(b"%PDF-")
+            except Exception:
+                is_pdf = False
+
+            upload_path = temp_download_path
+            upload_name = pdf_name
+
+            # PDF가 아니면 로컬에서 PDF로 변환 후 업로드
+            if not is_pdf:
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    f"[CONVERT] PDF가 아닌 파일을 PDF로 변환 중: {pdf_name}",
+                    "tool_usage_started", 9
+                )
+
+                # 확장자가 ".pdf"인데 실제 PDF가 아닌 경우(잘못된 힌트/URL) → Content-Type/파일명으로 보정 후 변환
+                try:
+                    src_p = Path(temp_download_path)
+                    name_ext = Path(pdf_name).suffix.lower()
+                    if src_p.suffix.lower() == ".pdf":
+                        fixed_ext = ""
+                        if name_ext and name_ext != ".pdf":
+                            fixed_ext = name_ext
+                        else:
+                            ct_map = {
+                                "application/msword": ".doc",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                                "application/vnd.ms-excel": ".xls",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                                "application/vnd.ms-powerpoint": ".ppt",
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                                "text/plain": ".txt",
+                                "text/csv": ".csv",
+                                "text/html": ".html",
+                                "application/rtf": ".rtf",
+                                "application/vnd.oasis.opendocument.text": ".odt",
+                                "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+                                "application/vnd.oasis.opendocument.presentation": ".odp",
+                            }
+                            fixed_ext = ct_map.get((inferred_ct or "").lower(), "")
+                        if fixed_ext and fixed_ext != ".pdf":
+                            new_path = str(src_p.with_suffix(fixed_ext))
+                            os.replace(temp_download_path, new_path)
+                            temp_download_path = new_path
+                            pdf_name = str(Path(pdf_name).with_suffix(fixed_ext))
+                except Exception:
+                    pass
+
+                try:
+                    from src.pdf2bpmn.converters.file_to_pdf import convert_to_pdf, FileToPdfError  # type: ignore
+
+                    converted_pdf = convert_to_pdf(str(temp_download_path), str(Path(str(temp_download_path)).parent))
+                    upload_path = converted_pdf
+                    upload_name = Path(converted_pdf).name
+                    temp_pdf_path = converted_pdf
+                    pdf_name = upload_name
+                except FileToPdfError as e:
+                    raise Exception(f"파일을 PDF로 변환하지 못했습니다: {e}")
+                finally:
+                    # 다운로드 원본은 가능하면 정리(변환 산출물과 경로가 다르면)
+                    try:
+                        if temp_download_path and temp_pdf_path and os.path.abspath(temp_download_path) != os.path.abspath(temp_pdf_path):
+                            if os.path.exists(temp_download_path):
+                                os.unlink(temp_download_path)
+                    except Exception:
+                        pass
+            else:
+                # PDF인데 확장자가 PDF가 아니면 업로드 파일명을 보정(서버가 변환을 오판하지 않게)
+                if not str(upload_name).lower().endswith(".pdf"):
+                    upload_name = str(Path(upload_name).with_suffix(".pdf"))
+                    pdf_name = upload_name
+
+            await self._send_progress_event(
+                event_queue, context_id, task_id, job_id,
+                f"[UPLOAD] 파일을 분석 서버에 업로드 중: {upload_name}",
                 "tool_usage_started", 10
             )
-            
-            # 파일 다운로드 (pdf/xlsx/pptx/image 등 모두 허용)
-            temp_pdf_path = await self._download_file(pdf_url, pdf_name)
-            
+
             # PDF2BPMN API에 업로드
-            with open(temp_pdf_path, 'rb') as f:
+            with open(upload_path, 'rb') as f:
                 # Content-Type은 일반적으로 octet-stream으로 보내고,
                 # 서버가 filename 확장자를 보고 PDF 변환 여부를 결정합니다.
-                files = {'file': (pdf_name, f, 'application/octet-stream')}
+                files = {'file': (upload_name, f, 'application/octet-stream')}
                 upload_response = await client.post(f"{self.pdf2bpmn_url}/api/upload", files=files)
             
             if upload_response.status_code != 200:
@@ -3851,7 +4570,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 
                 proc_json["processDefinitionId"] = proc_def_id
 
-                # proc_json은 이미 enrich+assignment까지 끝난 상태(생성 단계에서 수행)
+                # NOTE: 담당자/에이전트 매핑은 forms + 참조정보(inputData) 확장 이후 마지막 단계에서 수행됨.
                 
                 # BPMN XML 저장
                 all_bpmn_xmls[proc_def_id] = bpmn_xml
@@ -3916,6 +4635,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                 process_name=process_name,
                                 proc_json=proc_json,
                                 forms_result=forms_result,
+                                extracted=extracted_payload,
                                 tenant_id=tenant_id,
                                 event_queue=event_queue,
                                 context_id=context_id,
@@ -4046,10 +4766,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         finally:
             # 임시 파일 정리
-            if temp_pdf_path and os.path.exists(temp_pdf_path):
+            for p in [temp_pdf_path, temp_download_path]:
+                if not p:
+                    continue
                 try:
-                    os.unlink(temp_pdf_path)
-                    logger.info(f"[CLEANUP] Removed temp file: {temp_pdf_path}")
+                    if os.path.exists(p):
+                        os.unlink(p)
+                        logger.info(f"[CLEANUP] Removed temp file: {p}")
                 except Exception as e:
                     logger.warning(f"[WARN] Failed to remove temp file: {e}")
             
