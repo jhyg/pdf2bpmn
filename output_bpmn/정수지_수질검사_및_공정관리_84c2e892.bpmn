@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:uengine="http://www.uengine.org/schema/bpmn"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="Definitions_84c2e892-8a46-47d6-af24-3d774af04b74"
+                  name="정수지 수질검사 및 공정관리"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  exporter="Custom BPMN Modeler"
+                  exporterVersion="1.0">
+
+  <bpmn:collaboration id="Collaboration_84c2e892-8a46-47d6-af24-3d774af04b74">
+    <bpmn:participant id="Participant_84c2e892-8a46-47d6-af24-3d774af04b74"
+                      name="정수지 수질검사 및 공정관리"
+                      processRef="Process_84c2e892-8a46-47d6-af24-3d774af04b74" />
+  </bpmn:collaboration>
+
+  <bpmn:process id="Process_84c2e892-8a46-47d6-af24-3d774af04b74"
+                name="정수지 수질검사 및 공정관리"
+                isExecutable="true"
+                megaProcessId="미분류"
+                majorProcessId="미분류">
+    <bpmn:extensionElements>
+      <uengine:properties>
+        <uengine:json>{"definitionName": "정수지 수질검사 및 공정관리", "version": "1.0", "shortDescription": {"text": ""}}</uengine:json>
+      </uengine:properties>
+    </bpmn:extensionElements>
+
+    <bpmn:laneSet id="LaneSet_84c2e892-8a46-47d6-af24-3d774af04b74">
+      
+      <bpmn:lane id="Lane_f6f6e63d-4953-437b-9c19-997014dba641" name="수질 담당자" resolutionRule="undefined">
+        <bpmn:extensionElements>
+          <uengine:properties>
+            <uengine:json>{"roleResolutionContext": {"_type": "org.uengine.kernel.DirectRoleResolutionContext", "endpoint": []}}</uengine:json>
+          </uengine:properties>
+        </bpmn:extensionElements>
+        
+        <bpmn:flowNodeRef>Event_Start</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_5ba5c1a1</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_eb2c0780</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Event_End</bpmn:flowNodeRef>
+        
+      </bpmn:lane>
+      
+      
+    </bpmn:laneSet>
+
+    <!-- Start Event -->
+    <bpmn:startEvent id="Event_Start" name="Start">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "start event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:outgoing>SequenceFlow_Event_Start_Activity_5ba5c1a1</bpmn:outgoing>
+      
+    </bpmn:startEvent>
+
+    <!-- Tasks -->
+    
+    <bpmn:userTask id="Activity_5ba5c1a1" name="정수지 수질 항목 측정">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "수질 담당자", "duration": 5, "instruction": "정수지의 탁도, pH, 알칼리도, 잔류염소 등 수질 항목을 측정", "description": "정수지의 탁도, pH, 알칼리도, 잔류염소 등 수질 항목을 측정", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Event_Start_Activity_5ba5c1a1</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_5ba5c1a1_Activity_eb2c0780</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+    <bpmn:userTask id="Activity_eb2c0780" name="알칼리제 및 후염소 투입률 조정">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "수질 담당자", "duration": 5, "instruction": "수질 항목 측정 결과에 따라 알칼리제 투입 및 후염소 투입률을 조정", "description": "수질 항목 측정 결과에 따라 알칼리제 투입 및 후염소 투입률을 조정", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_5ba5c1a1_Activity_eb2c0780</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_eb2c0780_Event_End</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+
+    <!-- Gateways -->
+    
+
+    <!-- End Event -->
+    <bpmn:endEvent id="Event_End" name="End">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "end event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_eb2c0780_Event_End</bpmn:incoming>
+      
+    </bpmn:endEvent>
+
+    <!-- Sequence Flows -->
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Event_Start_Activity_5ba5c1a1" sourceRef="Event_Start" targetRef="Activity_5ba5c1a1">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_5ba5c1a1_Activity_eb2c0780" sourceRef="Activity_5ba5c1a1" targetRef="Activity_eb2c0780">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_eb2c0780_Event_End" sourceRef="Activity_eb2c0780" targetRef="Event_End">
+      
+    </bpmn:sequenceFlow>
+    
+
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_84c2e892-8a46-47d6-af24-3d774af04b74">
+    <bpmndi:BPMNPlane id="BPMNPlane_84c2e892-8a46-47d6-af24-3d774af04b74" bpmnElement="Collaboration_84c2e892-8a46-47d6-af24-3d774af04b74">
+
+      <bpmndi:BPMNShape id="Participant_84c2e892-8a46-47d6-af24-3d774af04b74_di" bpmnElement="Participant_84c2e892-8a46-47d6-af24-3d774af04b74" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+      </bpmndi:BPMNShape>
+
+      <!-- Lanes -->
+      
+      <bpmndi:BPMNShape id="Lane_f6f6e63d-4953-437b-9c19-997014dba641_di" bpmnElement="Lane_f6f6e63d-4953-437b-9c19-997014dba641" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Start -->
+      <bpmndi:BPMNShape id="Event_Start_di" bpmnElement="Event_Start">
+        <dc:Bounds x="40" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Tasks -->
+      
+      <bpmndi:BPMNShape id="Activity_5ba5c1a1_di" bpmnElement="Activity_5ba5c1a1">
+        <dc:Bounds x="140" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Activity_eb2c0780_di" bpmnElement="Activity_eb2c0780">
+        <dc:Bounds x="290" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Gateways -->
+      
+
+      <!-- End -->
+      <bpmndi:BPMNShape id="Event_End_di" bpmnElement="Event_End">
+        <dc:Bounds x="520" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Event_Start_Activity_5ba5c1a1_di" bpmnElement="SequenceFlow_Event_Start_Activity_5ba5c1a1">
+        <di:waypoint x="74" y="60" />
+        <di:waypoint x="140" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_5ba5c1a1_Activity_eb2c0780_di" bpmnElement="SequenceFlow_Activity_5ba5c1a1_Activity_eb2c0780">
+        <di:waypoint x="240" y="60" />
+        <di:waypoint x="290" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_eb2c0780_Event_End_di" bpmnElement="SequenceFlow_Activity_eb2c0780_Event_End">
+        <di:waypoint x="390" y="60" />
+        <di:waypoint x="520" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn:definitions>

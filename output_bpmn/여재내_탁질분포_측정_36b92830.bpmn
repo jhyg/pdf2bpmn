@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:uengine="http://www.uengine.org/schema/bpmn"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="Definitions_36b92830-afa7-40a5-9170-505b253fa8e2"
+                  name="여재내 탁질분포 측정"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  exporter="Custom BPMN Modeler"
+                  exporterVersion="1.0">
+
+  <bpmn:collaboration id="Collaboration_36b92830-afa7-40a5-9170-505b253fa8e2">
+    <bpmn:participant id="Participant_36b92830-afa7-40a5-9170-505b253fa8e2"
+                      name="여재내 탁질분포 측정"
+                      processRef="Process_36b92830-afa7-40a5-9170-505b253fa8e2" />
+  </bpmn:collaboration>
+
+  <bpmn:process id="Process_36b92830-afa7-40a5-9170-505b253fa8e2"
+                name="여재내 탁질분포 측정"
+                isExecutable="true"
+                megaProcessId="미분류"
+                majorProcessId="미분류">
+    <bpmn:extensionElements>
+      <uengine:properties>
+        <uengine:json>{"definitionName": "여재내 탁질분포 측정", "version": "1.0", "shortDescription": {"text": ""}}</uengine:json>
+      </uengine:properties>
+    </bpmn:extensionElements>
+
+    <bpmn:laneSet id="LaneSet_36b92830-afa7-40a5-9170-505b253fa8e2">
+      
+      <bpmn:lane id="Lane_b69b71da-a836-411a-a20f-ca2eb2f2577b" name="시험자" resolutionRule="undefined">
+        <bpmn:extensionElements>
+          <uengine:properties>
+            <uengine:json>{"roleResolutionContext": {"_type": "org.uengine.kernel.DirectRoleResolutionContext", "endpoint": []}}</uengine:json>
+          </uengine:properties>
+        </bpmn:extensionElements>
+        
+        <bpmn:flowNodeRef>Event_Start</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_ca841b97</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_a6869fd0</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_779fb927</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Event_End</bpmn:flowNodeRef>
+        
+      </bpmn:lane>
+      
+      
+    </bpmn:laneSet>
+
+    <!-- Start Event -->
+    <bpmn:startEvent id="Event_Start" name="Start">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "start event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:outgoing>SequenceFlow_Event_Start_Activity_ca841b97</bpmn:outgoing>
+      
+    </bpmn:startEvent>
+
+    <!-- Tasks -->
+    
+    <bpmn:userTask id="Activity_ca841b97" name="여재 시료 채취">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "시험자", "duration": 5, "instruction": "여재 단면별로 20cm 간격으로 코아채취관을 이용해 7개 구간 시료 채취", "description": "여재 단면별로 20cm 간격으로 코아채취관을 이용해 7개 구간 시료 채취", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Event_Start_Activity_ca841b97</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_ca841b97_Activity_a6869fd0</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+    <bpmn:userTask id="Activity_a6869fd0" name="여재 시료 교반 및 상징수 탁도 측정">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "시험자", "duration": 5, "instruction": "채취한 시료를 증류수에 담가 Jar-Tester에서 200rpm으로 30분간 교반 후 상징수의 탁도를 측정", "description": "채취한 시료를 증류수에 담가 Jar-Tester에서 200rpm으로 30분간 교반 후 상징수의 탁도를 측정", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_ca841b97_Activity_a6869fd0</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_a6869fd0_Activity_779fb927</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+    <bpmn:userTask id="Activity_779fb927" name="역세척 전후 반복 시험 및 결과 그래프 도시">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "시험자", "duration": 5, "instruction": "동일한 시험을 역세척 전후에 1회씩 실시하고 결과를 그래프로 도시", "description": "동일한 시험을 역세척 전후에 1회씩 실시하고 결과를 그래프로 도시", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_a6869fd0_Activity_779fb927</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_779fb927_Event_End</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+
+    <!-- Gateways -->
+    
+
+    <!-- End Event -->
+    <bpmn:endEvent id="Event_End" name="End">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "end event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_779fb927_Event_End</bpmn:incoming>
+      
+    </bpmn:endEvent>
+
+    <!-- Sequence Flows -->
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Event_Start_Activity_ca841b97" sourceRef="Event_Start" targetRef="Activity_ca841b97">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_ca841b97_Activity_a6869fd0" sourceRef="Activity_ca841b97" targetRef="Activity_a6869fd0">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_a6869fd0_Activity_779fb927" sourceRef="Activity_a6869fd0" targetRef="Activity_779fb927">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_779fb927_Event_End" sourceRef="Activity_779fb927" targetRef="Event_End">
+      
+    </bpmn:sequenceFlow>
+    
+
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_36b92830-afa7-40a5-9170-505b253fa8e2">
+    <bpmndi:BPMNPlane id="BPMNPlane_36b92830-afa7-40a5-9170-505b253fa8e2" bpmnElement="Collaboration_36b92830-afa7-40a5-9170-505b253fa8e2">
+
+      <bpmndi:BPMNShape id="Participant_36b92830-afa7-40a5-9170-505b253fa8e2_di" bpmnElement="Participant_36b92830-afa7-40a5-9170-505b253fa8e2" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+      </bpmndi:BPMNShape>
+
+      <!-- Lanes -->
+      
+      <bpmndi:BPMNShape id="Lane_b69b71da-a836-411a-a20f-ca2eb2f2577b_di" bpmnElement="Lane_b69b71da-a836-411a-a20f-ca2eb2f2577b" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Start -->
+      <bpmndi:BPMNShape id="Event_Start_di" bpmnElement="Event_Start">
+        <dc:Bounds x="40" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Tasks -->
+      
+      <bpmndi:BPMNShape id="Activity_ca841b97_di" bpmnElement="Activity_ca841b97">
+        <dc:Bounds x="140" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Activity_a6869fd0_di" bpmnElement="Activity_a6869fd0">
+        <dc:Bounds x="290" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Activity_779fb927_di" bpmnElement="Activity_779fb927">
+        <dc:Bounds x="440" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Gateways -->
+      
+
+      <!-- End -->
+      <bpmndi:BPMNShape id="Event_End_di" bpmnElement="Event_End">
+        <dc:Bounds x="670" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Event_Start_Activity_ca841b97_di" bpmnElement="SequenceFlow_Event_Start_Activity_ca841b97">
+        <di:waypoint x="74" y="60" />
+        <di:waypoint x="140" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_ca841b97_Activity_a6869fd0_di" bpmnElement="SequenceFlow_Activity_ca841b97_Activity_a6869fd0">
+        <di:waypoint x="240" y="60" />
+        <di:waypoint x="290" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_a6869fd0_Activity_779fb927_di" bpmnElement="SequenceFlow_Activity_a6869fd0_Activity_779fb927">
+        <di:waypoint x="390" y="60" />
+        <di:waypoint x="440" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_779fb927_Event_End_di" bpmnElement="SequenceFlow_Activity_779fb927_Event_End">
+        <di:waypoint x="540" y="60" />
+        <di:waypoint x="670" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn:definitions>

@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:uengine="http://www.uengine.org/schema/bpmn"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="Definitions_9499c38a-69c2-4aee-8a98-7daeb1f9e91f"
+                  name="수돗물 냄새발생 대비 수질관리"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  exporter="Custom BPMN Modeler"
+                  exporterVersion="1.0">
+
+  <bpmn:collaboration id="Collaboration_9499c38a-69c2-4aee-8a98-7daeb1f9e91f">
+    <bpmn:participant id="Participant_9499c38a-69c2-4aee-8a98-7daeb1f9e91f"
+                      name="수돗물 냄새발생 대비 수질관리"
+                      processRef="Process_9499c38a-69c2-4aee-8a98-7daeb1f9e91f" />
+  </bpmn:collaboration>
+
+  <bpmn:process id="Process_9499c38a-69c2-4aee-8a98-7daeb1f9e91f"
+                name="수돗물 냄새발생 대비 수질관리"
+                isExecutable="true"
+                megaProcessId="미분류"
+                majorProcessId="미분류">
+    <bpmn:extensionElements>
+      <uengine:properties>
+        <uengine:json>{"definitionName": "수돗물 냄새발생 대비 수질관리", "version": "1.0", "shortDescription": {"text": ""}}</uengine:json>
+      </uengine:properties>
+    </bpmn:extensionElements>
+
+    <bpmn:laneSet id="LaneSet_9499c38a-69c2-4aee-8a98-7daeb1f9e91f">
+      
+      <bpmn:lane id="Lane_f6f6e63d-4953-437b-9c19-997014dba641" name="수질 담당자" resolutionRule="undefined">
+        <bpmn:extensionElements>
+          <uengine:properties>
+            <uengine:json>{"roleResolutionContext": {"_type": "org.uengine.kernel.DirectRoleResolutionContext", "endpoint": []}}</uengine:json>
+          </uengine:properties>
+        </bpmn:extensionElements>
+        
+        <bpmn:flowNodeRef>Event_Start</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_4d9e1139</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_000c82e8</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Event_End</bpmn:flowNodeRef>
+        
+      </bpmn:lane>
+      
+      <bpmn:lane id="Lane_f4c5be8c-9552-4fbc-8c68-010fc692a036" name="정수처리 시스템" resolutionRule="undefined">
+        <bpmn:extensionElements>
+          <uengine:properties>
+            <uengine:json>{"roleResolutionContext": {"_type": "org.uengine.kernel.DirectRoleResolutionContext", "endpoint": []}}</uengine:json>
+          </uengine:properties>
+        </bpmn:extensionElements>
+        
+        <bpmn:flowNodeRef>Event_Start</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Activity_6a19f4f4</bpmn:flowNodeRef>
+        
+        <bpmn:flowNodeRef>Event_End</bpmn:flowNodeRef>
+        
+      </bpmn:lane>
+      
+      
+    </bpmn:laneSet>
+
+    <!-- Start Event -->
+    <bpmn:startEvent id="Event_Start" name="Start">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "start event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:outgoing>SequenceFlow_Event_Start_Activity_4d9e1139</bpmn:outgoing>
+      
+    </bpmn:startEvent>
+
+    <!-- Tasks -->
+    
+    <bpmn:userTask id="Activity_4d9e1139" name="원수수질 조사">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "수질 담당자", "duration": 5, "instruction": "원수의 조류종, 조류개체수, 냄새를 주 1회(필요시 일 1회) 조사한다.", "description": "원수의 조류종, 조류개체수, 냄새를 주 1회(필요시 일 1회) 조사한다.", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Event_Start_Activity_4d9e1139</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_4d9e1139_Gateway_189fd657</bpmn:outgoing>
+      
+      <bpmn:outgoing>SequenceFlow_Activity_4d9e1139_Activity_000c82e8</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+    <bpmn:userTask id="Activity_000c82e8" name="냄새 측정">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "수질 담당자", "duration": 5, "instruction": "TON 시험법에 따라 냄새를 측정한다.", "description": "TON 시험법에 따라 냄새를 측정한다.", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Gateway_189fd657_Activity_000c82e8</bpmn:incoming>
+      
+      <bpmn:incoming>SequenceFlow_Activity_4d9e1139_Activity_000c82e8</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_000c82e8_Activity_6a19f4f4</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+    <bpmn:userTask id="Activity_6a19f4f4" name="정수처리">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"role": "정수처리 시스템", "duration": 5, "instruction": "냄새발생 원인물질 및 농도에 따라 전염소처리를 강화한다.", "description": "냄새발생 원인물질 및 농도에 따라 전염소처리를 강화한다.", "checkpoints": [], "agent": null, "agentMode": "none", "orchestration": null, "attachments": [], "inputData": [], "tool": "formHandler:defaultform", "customProperties": []}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_000c82e8_Activity_6a19f4f4</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Activity_6a19f4f4_Event_End</bpmn:outgoing>
+      
+    </bpmn:userTask>
+    
+
+    <!-- Gateways -->
+    
+    <bpmn:exclusiveGateway id="Gateway_189fd657" name="원수수질 조사 결과가 일정 기준을 초과했는지 여부에 따라 측정주기를 결정">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "원수수질 조사 결과가 일정 기준을 초과했는지 여부에 따라 측정주기를 결정", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_4d9e1139_Gateway_189fd657</bpmn:incoming>
+      
+      
+      <bpmn:outgoing>SequenceFlow_Gateway_189fd657_Activity_000c82e8</bpmn:outgoing>
+      
+    </bpmn:exclusiveGateway>
+    
+
+    <!-- End Event -->
+    <bpmn:endEvent id="Event_End" name="End">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "end event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+      <bpmn:incoming>SequenceFlow_Activity_6a19f4f4_Event_End</bpmn:incoming>
+      
+    </bpmn:endEvent>
+
+    <!-- Sequence Flows -->
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Event_Start_Activity_4d9e1139" sourceRef="Event_Start" targetRef="Activity_4d9e1139">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_4d9e1139_Gateway_189fd657" sourceRef="Activity_4d9e1139" targetRef="Gateway_189fd657">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Gateway_189fd657_Activity_000c82e8" sourceRef="Gateway_189fd657" targetRef="Activity_000c82e8" name="일정기준 초과시">
+      
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"conditionMode": "text"}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_4d9e1139_Activity_000c82e8" sourceRef="Activity_4d9e1139" targetRef="Activity_000c82e8">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_000c82e8_Activity_6a19f4f4" sourceRef="Activity_000c82e8" targetRef="Activity_6a19f4f4">
+      
+    </bpmn:sequenceFlow>
+    
+    <bpmn:sequenceFlow id="SequenceFlow_Activity_6a19f4f4_Event_End" sourceRef="Activity_6a19f4f4" targetRef="Event_End">
+      
+    </bpmn:sequenceFlow>
+    
+
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_9499c38a-69c2-4aee-8a98-7daeb1f9e91f">
+    <bpmndi:BPMNPlane id="BPMNPlane_9499c38a-69c2-4aee-8a98-7daeb1f9e91f" bpmnElement="Collaboration_9499c38a-69c2-4aee-8a98-7daeb1f9e91f">
+
+      <bpmndi:BPMNShape id="Participant_9499c38a-69c2-4aee-8a98-7daeb1f9e91f_di" bpmnElement="Participant_9499c38a-69c2-4aee-8a98-7daeb1f9e91f" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="240" />
+      </bpmndi:BPMNShape>
+
+      <!-- Lanes -->
+      
+      <bpmndi:BPMNShape id="Lane_f6f6e63d-4953-437b-9c19-997014dba641_di" bpmnElement="Lane_f6f6e63d-4953-437b-9c19-997014dba641" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Lane_f4c5be8c-9552-4fbc-8c68-010fc692a036_di" bpmnElement="Lane_f4c5be8c-9552-4fbc-8c68-010fc692a036" isHorizontal="true">
+        <dc:Bounds x="0" y="120" width="1200" height="120" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Start -->
+      <bpmndi:BPMNShape id="Event_Start_di" bpmnElement="Event_Start">
+        <dc:Bounds x="40" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Tasks -->
+      
+      <bpmndi:BPMNShape id="Activity_4d9e1139_di" bpmnElement="Activity_4d9e1139">
+        <dc:Bounds x="140" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Activity_000c82e8_di" bpmnElement="Activity_000c82e8">
+        <dc:Bounds x="290" y="20" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+      <bpmndi:BPMNShape id="Activity_6a19f4f4_di" bpmnElement="Activity_6a19f4f4">
+        <dc:Bounds x="440" y="140" width="100" height="80" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- Gateways -->
+      
+      <bpmndi:BPMNShape id="Gateway_189fd657_di" bpmnElement="Gateway_189fd657" isMarkerVisible="true">
+        <dc:Bounds x="590" y="35" width="50" height="50" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      
+
+      <!-- End -->
+      <bpmndi:BPMNShape id="Event_End_di" bpmnElement="Event_End">
+        <dc:Bounds x="820" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Event_Start_Activity_4d9e1139_di" bpmnElement="SequenceFlow_Event_Start_Activity_4d9e1139">
+        <di:waypoint x="74" y="60" />
+        <di:waypoint x="140" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_4d9e1139_Gateway_189fd657_di" bpmnElement="SequenceFlow_Activity_4d9e1139_Gateway_189fd657">
+        <di:waypoint x="240" y="60" />
+        <di:waypoint x="590" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Gateway_189fd657_Activity_000c82e8_di" bpmnElement="SequenceFlow_Gateway_189fd657_Activity_000c82e8">
+        <di:waypoint x="640" y="60" />
+        <di:waypoint x="290" y="60" />
+        
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="435" y="40" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_4d9e1139_Activity_000c82e8_di" bpmnElement="SequenceFlow_Activity_4d9e1139_Activity_000c82e8">
+        <di:waypoint x="240" y="60" />
+        <di:waypoint x="290" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_000c82e8_Activity_6a19f4f4_di" bpmnElement="SequenceFlow_Activity_000c82e8_Activity_6a19f4f4">
+        <di:waypoint x="390" y="60" />
+        <di:waypoint x="440" y="180" />
+        
+      </bpmndi:BPMNEdge>
+      
+      <bpmndi:BPMNEdge id="SequenceFlow_Activity_6a19f4f4_Event_End_di" bpmnElement="SequenceFlow_Activity_6a19f4f4_Event_End">
+        <di:waypoint x="540" y="180" />
+        <di:waypoint x="820" y="60" />
+        
+      </bpmndi:BPMNEdge>
+      
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn:definitions>

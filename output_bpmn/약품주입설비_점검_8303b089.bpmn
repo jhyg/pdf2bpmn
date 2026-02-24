@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:uengine="http://www.uengine.org/schema/bpmn"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="Definitions_8303b089-235e-4477-9106-e2a856895319"
+                  name="약품주입설비 점검"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  exporter="Custom BPMN Modeler"
+                  exporterVersion="1.0">
+
+  <bpmn:collaboration id="Collaboration_8303b089-235e-4477-9106-e2a856895319">
+    <bpmn:participant id="Participant_8303b089-235e-4477-9106-e2a856895319"
+                      name="약품주입설비 점검"
+                      processRef="Process_8303b089-235e-4477-9106-e2a856895319" />
+  </bpmn:collaboration>
+
+  <bpmn:process id="Process_8303b089-235e-4477-9106-e2a856895319"
+                name="약품주입설비 점검"
+                isExecutable="true"
+                megaProcessId="미분류"
+                majorProcessId="미분류">
+    <bpmn:extensionElements>
+      <uengine:properties>
+        <uengine:json>{"definitionName": "약품주입설비 점검", "version": "1.0", "shortDescription": {"text": ""}}</uengine:json>
+      </uengine:properties>
+    </bpmn:extensionElements>
+
+    <bpmn:laneSet id="LaneSet_8303b089-235e-4477-9106-e2a856895319">
+      
+      
+    </bpmn:laneSet>
+
+    <!-- Start Event -->
+    <bpmn:startEvent id="Event_Start" name="Start">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "start event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+    </bpmn:startEvent>
+
+    <!-- Tasks -->
+    
+
+    <!-- Gateways -->
+    
+
+    <!-- End Event -->
+    <bpmn:endEvent id="Event_End" name="End">
+      <bpmn:extensionElements>
+        <uengine:properties>
+          <uengine:json>{"description": "end event", "role": ""}</uengine:json>
+        </uengine:properties>
+      </bpmn:extensionElements>
+      
+    </bpmn:endEvent>
+
+    <!-- Sequence Flows -->
+    
+
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_8303b089-235e-4477-9106-e2a856895319">
+    <bpmndi:BPMNPlane id="BPMNPlane_8303b089-235e-4477-9106-e2a856895319" bpmnElement="Collaboration_8303b089-235e-4477-9106-e2a856895319">
+
+      <bpmndi:BPMNShape id="Participant_8303b089-235e-4477-9106-e2a856895319_di" bpmnElement="Participant_8303b089-235e-4477-9106-e2a856895319" isHorizontal="true">
+        <dc:Bounds x="0" y="0" width="1200" height="120" />
+      </bpmndi:BPMNShape>
+
+      <!-- Lanes -->
+      
+
+      <!-- Start -->
+      <bpmndi:BPMNShape id="Event_Start_di" bpmnElement="Event_Start">
+        <dc:Bounds x="40" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Tasks -->
+      
+
+      <!-- Gateways -->
+      
+
+      <!-- End -->
+      <bpmndi:BPMNShape id="Event_End_di" bpmnElement="Event_End">
+        <dc:Bounds x="220" y="43" width="34" height="34" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn:definitions>
