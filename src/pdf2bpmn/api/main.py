@@ -207,6 +207,15 @@ async def process_pdf_background(job_id: str):
         await asyncio.sleep(0)  # Allow SSE to send
         await loop.run_in_executor(executor, workflow.neo4j.init_schema)
         
+        # Clear existing Process-related nodes before creating new ones
+        update_step(job, 0, "processing", 7, "기존 프로세스 노드 정리 중...")
+        await asyncio.sleep(0)
+        clear_result = await loop.run_in_executor(executor, workflow.neo4j.clear_process_core_labels)
+        deleted_count = clear_result.get("deleted_nodes", 0)
+        if deleted_count > 0:
+            update_step(job, 0, "processing", 9, f"기존 노드 {deleted_count}개 삭제 완료")
+            await asyncio.sleep(0)
+        
         update_step(job, 0, "processing", 10, "PDF 파일 로딩 중...")
         await asyncio.sleep(0)
         

@@ -62,8 +62,8 @@ node_modules/
 output/
 uploads/
 
-# UV lock file
-uv.lock
+# UV lock file - KEEP for faster builds
+# uv.lock
 
 # Scripts not needed in container
 scripts/

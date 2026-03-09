@@ -43,8 +43,12 @@ RUN sed -i 's/^# *ko_KR.UTF-8 UTF-8/ko_KR.UTF-8 UTF-8/' /etc/locale.gen \
 ENV LANG=ko_KR.UTF-8 \
     LC_ALL=ko_KR.UTF-8
 
+# Install uv for faster dependency resolution
+RUN pip install uv
+
 # Copy requirements files
 COPY pyproject.toml ./
+COPY uv.lock ./
 COPY requirements-agent.txt ./
 # Needed for `-e .` (pyproject readme points to README.md)
 COPY README.md ./
@@ -55,33 +59,15 @@ COPY run.py ./
 COPY pdf2bpmn_agent_executor.py ./
 COPY pdf2bpmn_agent_server.py ./
 COPY pdf2bpmn_scaledjob_worker.py ./
+COPY a2a_server.py ./
+COPY a2a_client.py ./
 
-# Install Python dependencies
-# 1. Install main package dependencies from pyproject.toml
-RUN pip install --no-cache-dir \
-    langgraph>=0.2.0 \
-    langchain>=0.3.0 \
-    langchain-openai>=0.2.0 \
-    langchain-community>=0.3.0 \
-    neo4j>=5.0.0 \
-    openai>=1.0.0 \
-    pypdf>=4.0.0 \
-    pdfplumber>=0.11.0 \
-    pymupdf>=1.24.0 \
-    pillow>=10.0.0 \
-    pytesseract>=0.3.10 \
-    tiktoken>=0.7.0 \
-    numpy>=1.26.0 \
-    pydantic>=2.0.0 \
-    python-dotenv>=1.0.0 \
-    jinja2>=3.1.0 \
-    uuid6>=2024.0.0 \
-    fastapi>=0.115.0 \
-    uvicorn>=0.32.0 \
-    python-multipart>=0.0.12
-
-# 2. Install agent-specific dependencies
-RUN pip install --no-cache-dir -r requirements-agent.txt
+# Install Python dependencies using uv (much faster with lock file)
+# Use --system to install to system Python instead of creating a venv
+# Note: numpy<2.0 for older CPU compatibility (no X86_V2 requirement)
+RUN uv pip install --system "numpy<2.0" && \
+    uv pip install --system -e . && \
+    uv pip install --system process-gpt-agent-sdk==0.4.13 supabase>=2.0.0 httpx>=0.25.0 sse-starlette>=2.0.0
 
 # Create necessary directories
 RUN mkdir -p /app/output /app/uploads

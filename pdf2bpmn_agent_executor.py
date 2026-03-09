@@ -4797,7 +4797,45 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     pdf_name = str(Path(pdf_name).with_suffix(".pdf"))
 
             # =================================================================
-            # 5. PDF2BPMN 워크플로우를 "직접 호출"로 실행 (FastAPI BackgroundTasks 제거)
+            # 5. 선행 정리: 기존 프로세스 핵심 라벨만 삭제 (교차 실행 데이터 혼합 방지)
+            # =================================================================
+            await self._send_progress_event(
+                event_queue, context_id, task_id, job_id,
+                "[CLEANUP] 기존 프로세스/태스크 그래프를 정리합니다...",
+                "tool_usage_started", 12
+            )
+
+            try:
+                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
+
+                def _clear_process_core_labels_sync() -> Dict[str, Any]:
+                    client = Neo4jClient()
+                    try:
+                        return client.clear_process_core_labels()
+                    finally:
+                        client.close()
+
+                cleanup_result = await asyncio.to_thread(_clear_process_core_labels_sync)
+                deleted_nodes = int(cleanup_result.get("deleted_nodes", 0) or 0)
+                logger.info(
+                    "[CLEANUP] Process-core labels cleared before run: "
+                    f"deleted_nodes={deleted_nodes}, labels={cleanup_result.get('labels', [])}"
+                )
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    f"[CLEANUP] 기존 그래프 정리 완료 (삭제 노드: {deleted_nodes})",
+                    "tool_usage_finished", 14,
+                    {"cleanup": cleanup_result}
+                )
+            except Exception as e:
+                logger.error(f"[CLEANUP] Failed to clear process-core labels: {e}")
+                # Fail fast by design: run should not continue with mixed legacy graph data.
+                raise Exception(
+                    f"Neo4j 선삭제 실패로 작업을 중단합니다: {e}"
+                ) from e
+
+            # =================================================================
+            # 6. PDF2BPMN 워크플로우를 "직접 호출"로 실행 (FastAPI BackgroundTasks 제거)
             # =================================================================
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
@@ -4967,7 +5005,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     pass
 
             # =================================================================
-            # 6. 이번 작업에서 생성된 process_id 목록을 state에서 직접 수집 + Neo4j에서 상세 조회
+            # 7. 이번 작업에서 생성된 process_id 목록을 state에서 직접 수집 + Neo4j에서 상세 조회
             # =================================================================
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,

@@ -15,6 +15,16 @@ from ..models.entities import (
 
 class Neo4jClient:
     """Client for Neo4j database operations."""
+    PROCESS_CORE_LABELS = [
+        "Process",
+        "Task",
+        "Role",
+        "Gateway",
+        "Event",
+        "Skill",
+        "DMNDecision",
+        "DMNRule",
+    ]
     
     def __init__(
         self,
@@ -124,6 +134,35 @@ class Neo4jClient:
         """Clear all nodes and relationships (use with caution!)."""
         with self.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
+
+    def clear_process_core_labels(self, labels: Optional[list[str]] = None) -> dict[str, Any]:
+        """Delete only process-core labels and keep unrelated graph data."""
+        target_labels = labels or self.PROCESS_CORE_LABELS
+        if not target_labels:
+            return {"labels": [], "deleted_nodes": 0}
+
+        with self.session() as session:
+            before_query = """
+            MATCH (n)
+            WHERE any(label IN labels(n) WHERE label IN $target_labels)
+            RETURN count(n) AS count
+            """
+            before_count = session.run(
+                before_query,
+                {"target_labels": target_labels},
+            ).single()["count"]
+
+            delete_query = """
+            MATCH (n)
+            WHERE any(label IN labels(n) WHERE label IN $target_labels)
+            DETACH DELETE n
+            """
+            session.run(delete_query, {"target_labels": target_labels})
+
+        return {
+            "labels": target_labels,
+            "deleted_nodes": before_count,
+        }
     
     # ==================== Create Operations ====================
     
