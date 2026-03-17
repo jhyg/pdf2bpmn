@@ -13,6 +13,15 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any
 
+# Optional: embedded API server (Neo4j graph gateway for frontend)
+try:
+    from fastapi import FastAPI, HTTPException  # type: ignore
+    from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+    import uvicorn  # type: ignore
+    FASTAPI_AVAILABLE = True
+except Exception:
+    FASTAPI_AVAILABLE = False
+
 # 현재 디렉토리를 Python 경로에 추가
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
@@ -50,6 +59,10 @@ except ImportError as e:
 
 # 로컬 모듈 imports
 from pdf2bpmn_agent_executor import PDF2BPMNAgentExecutor
+try:
+    from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
+except Exception:
+    Neo4jClient = None
 
 # 로깅 설정
 logging.basicConfig(
@@ -73,6 +86,11 @@ class PDF2BPMNServerConfig:
         # PDF2BPMN 서버 설정
         self.pdf2bpmn_url = os.getenv("PDF2BPMN_URL", "http://localhost:8001")
         self.task_timeout = int(os.getenv("TASK_TIMEOUT", "3600"))  # 1시간
+
+        # Embedded Graph API (for frontend)
+        self.graph_api_enabled = os.getenv("GRAPH_API_ENABLED", "true").lower() in ("1", "true", "yes", "y", "on")
+        self.graph_api_host = os.getenv("GRAPH_API_HOST", "0.0.0.0")
+        self.graph_api_port = int(os.getenv("GRAPH_API_PORT", "8012"))
         
         # 환경 검증
         self.validate()
@@ -96,7 +114,10 @@ class PDF2BPMNServerConfig:
             "polling_interval": self.polling_interval,
             "agent_orch": self.agent_orch,
             "pdf2bpmn_url": self.pdf2bpmn_url,
-            "task_timeout": self.task_timeout
+            "task_timeout": self.task_timeout,
+            "graph_api_enabled": self.graph_api_enabled,
+            "graph_api_host": self.graph_api_host,
+            "graph_api_port": self.graph_api_port,
         }
 
 
@@ -108,6 +129,8 @@ class PDF2BPMNServerManager:
         self.server: ProcessGPTAgentServer = None
         self.executor: PDF2BPMNAgentExecutor = None
         self.is_running = False
+        self._graph_api_task: asyncio.Task | None = None
+        self._graph_api_server: Any = None
         
         # 신호 핸들러 설정
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -153,6 +176,99 @@ class PDF2BPMNServerManager:
         except Exception as e:
             logger.error(f"ProcessGPT 서버 생성 실패: {e}")
             return False
+
+    def _build_graph_api_app(self) -> FastAPI:
+        """
+        Minimal embedded API:
+        - /api/health
+        - /api/processes/{proc_id}/graph  (Neo4j subgraph -> cytoscape elements)
+        """
+        app = FastAPI(title="PDF2BPMN Embedded Graph API", version="0.1.0")
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        )
+
+        @app.get("/api/health")
+        async def health():
+            if Neo4jClient is None:
+                return {"status": "ok", "neo4j": "unavailable"}
+            neo4j = Neo4jClient()
+            try:
+                ok = neo4j.verify_connection()
+            finally:
+                try:
+                    neo4j.close()
+                except Exception:
+                    pass
+            return {"status": "ok", "neo4j": "connected" if ok else "disconnected"}
+
+        @app.get("/api")
+        async def api_root():
+            return {
+                "status": "ok",
+                "name": "PDF2BPMN Embedded Graph API",
+                "endpoints": ["/api/health", "/api/processes/{proc_id}/graph"],
+            }
+
+        @app.get("/api/processes/{proc_id}/graph")
+        async def process_graph(proc_id: str):
+            if Neo4jClient is None:
+                raise HTTPException(500, "Neo4jClient is not available in this runtime")
+            neo4j = Neo4jClient()
+            try:
+                data = neo4j.get_process_graph_elements(proc_id)
+                if not data:
+                    raise HTTPException(404, "Process not found")
+                return data
+            finally:
+                try:
+                    neo4j.close()
+                except Exception:
+                    pass
+
+        return app
+
+    async def _start_embedded_graph_api(self):
+        if not self.config.graph_api_enabled:
+            return
+        if not FASTAPI_AVAILABLE:
+            logger.warning("[WARN] GRAPH_API_ENABLED=true but fastapi/uvicorn not available. Skipping embedded API.")
+            return
+        if Neo4jClient is None:
+            logger.warning("[WARN] GRAPH_API_ENABLED=true but Neo4jClient import failed. Skipping embedded API.")
+            return
+
+        try:
+            app = self._build_graph_api_app()
+            cfg = uvicorn.Config(app, host=self.config.graph_api_host, port=self.config.graph_api_port, log_level="info")
+            server = uvicorn.Server(cfg)
+            self._graph_api_server = server
+            logger.info(f"[OK] Embedded Graph API starting on http://{self.config.graph_api_host}:{self.config.graph_api_port}/api")
+            await server.serve()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"[WARN] Embedded Graph API failed to start: {e}")
+
+    async def _stop_embedded_graph_api(self):
+        try:
+            if self._graph_api_server is not None:
+                try:
+                    self._graph_api_server.should_exit = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._graph_api_task is not None and not self._graph_api_task.done():
+                self._graph_api_task.cancel()
+        except Exception:
+            pass
     
     async def start(self):
         """서버 시작"""
@@ -171,6 +287,8 @@ class PDF2BPMNServerManager:
         print(f"[>] Polling Interval: {self.config.polling_interval}s")
         print(f"[>] PDF2BPMN Server: {self.config.pdf2bpmn_url}")
         print(f"[>] Task Timeout: {self.config.task_timeout}s")
+        if self.config.graph_api_enabled:
+            print(f"[>] Embedded Graph API: http://localhost:{self.config.graph_api_port}/api  (GRAPH_API_PORT)")
         print()
         print("[*] Supported Tasks:")
         print("  - PDF to BPMN conversion")
@@ -187,6 +305,10 @@ class PDF2BPMNServerManager:
         print()
         
         try:
+            # Start embedded graph API in background (same process)
+            if self.config.graph_api_enabled:
+                self._graph_api_task = asyncio.create_task(self._start_embedded_graph_api())
+
             # ProcessGPT 서버 실행 (무한 폴링 루프)
             await self.server.run()
             
@@ -203,6 +325,8 @@ class PDF2BPMNServerManager:
         """서버 중지"""
         logger.info("서버 종료 중...")
         self.is_running = False
+
+        await self._stop_embedded_graph_api()
         
         if self.server:
             try:

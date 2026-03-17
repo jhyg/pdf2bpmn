@@ -503,7 +503,7 @@ class PDF2BPMNWorkflow:
             if task.task_id in self.task_role_map:
                 continue  # Already has a role
             
-            task_text = (task.name + " " + task.description).lower()
+            task_text = (task.name + " " + task.description + " " + (getattr(task, "instruction", "") or "")).lower()
             
             for role_id, keywords in role_keywords.items():
                 for keyword in keywords:
@@ -707,6 +707,29 @@ class PDF2BPMNWorkflow:
                 descriptions = [t.description for t in all_related if t.description]
                 if descriptions:
                     representative.description = " | ".join(set(descriptions))
+
+                # 지침(instruction) 통합: 더 구체적인 지침 우선, 필요 시 줄 단위로 병합
+                instructions = [
+                    getattr(t, "instruction", "") for t in all_related if getattr(t, "instruction", "")
+                ]
+                if instructions:
+                    def _score_instruction(x: str) -> tuple[int, int]:
+                        lines = [ln.strip() for ln in (x or "").splitlines() if ln.strip()]
+                        return (len(lines), len(x))
+
+                    best = max(instructions, key=_score_instruction)
+                    merged_lines: list[str] = []
+                    seen = set()
+                    for src in [best, *instructions]:
+                        for ln in (src or "").splitlines():
+                            s = ln.strip()
+                            if not s:
+                                continue
+                            if s in seen:
+                                continue
+                            seen.add(s)
+                            merged_lines.append(s)
+                    representative.instruction = "\n".join(merged_lines[:20]).strip()
                 
                 # ID 매핑 기록
                 for t in all_related:

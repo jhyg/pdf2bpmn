@@ -96,14 +96,17 @@ class SkillGenerator:
         """Generate skill document from a task."""
         
         # Create skill from task
+        instruction = (getattr(task, "instruction", "") or "").strip()
+        description = (task.description or "").strip()
+        procedure_source = instruction or description
         skill = Skill(
             name=f"{task.name} Skill",
-            summary=task.description,
-            purpose=task.description or f"{task.name} 태스크를 수행합니다.",
+            summary=description or instruction,
+            purpose=description or f"{task.name} 태스크를 수행합니다.",
             inputs={},
             outputs={},
             preconditions=[],
-            procedure=self._extract_procedure(task.description),
+            procedure=self._extract_procedure(procedure_source),
             exceptions=["오류 발생 시 재시도", "실패 시 상위 보고"],
             tools=[]
         )

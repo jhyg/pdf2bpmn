@@ -538,6 +538,19 @@ async def get_process_detail(proc_id: str):
         neo4j.close()
 
 
+@app.get("/api/processes/{proc_id}/graph")
+async def get_process_graph(proc_id: str):
+    """Get the *actual extracted* Neo4j subgraph (nodes + relationships) for a process."""
+    neo4j = Neo4jClient()
+    try:
+        data = neo4j.get_process_graph_elements(proc_id)
+        if not data:
+            raise HTTPException(404, "Process not found")
+        return data
+    finally:
+        neo4j.close()
+
+
 @app.get("/api/tasks")
 async def get_tasks():
     """Get all tasks with relationships."""

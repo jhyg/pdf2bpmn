@@ -117,6 +117,7 @@ class Task(BaseEntity):
     name: str
     task_type: TaskType = TaskType.HUMAN
     description: str = ""
+    instruction: str = ""
     order: int = 0
 
 

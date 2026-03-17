@@ -20,7 +20,9 @@ import traceback
 import xml.etree.ElementTree as ET
 import sys
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, quote
+import io
+import zipfile
 
 from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerator
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
@@ -245,6 +247,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         #   PDF2BPMN_URL의 host가 localhost면 127.0.0.1로 고정합니다.
         if self._is_running_in_docker():
             self.pdf2bpmn_url = self._rewrite_localhost_url(self.pdf2bpmn_url, localhost_target="127.0.0.1")
+
+        # Claude Skills 서비스(제품 UI가 사용하는 스킬 스토리지)
+        self.claude_skills_base_url = os.getenv(
+            "CLAUDE_SKILLS_BASE_URL",
+            self.config.get("claude_skills_base_url", "http://localhost:8088/claude-skills"),
+        )
+        if self._is_running_in_docker():
+            self.claude_skills_base_url = self._rewrite_localhost_url(
+                self.claude_skills_base_url, localhost_target="127.0.0.1"
+            )
         
         # Supabase 설정
         self.supabase_url = os.getenv('SUPABASE_URL')
@@ -326,6 +338,151 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if self.http_client is None:
             self.http_client = httpx.AsyncClient(timeout=self.timeout)
         return self.http_client
+
+    # -----------------------------------------------------------------------
+    # Skill upload + Supabase sync (UI-compatible)
+    # -----------------------------------------------------------------------
+
+    def _normalize_skill_key(self, name: str) -> str:
+        """Claude Skills 서비스 경로에 쓸 안전한 스킬 키."""
+        s = " ".join(str(name or "").split()).strip()
+        s = s.replace("\\", "_").replace("/", "_").replace("..", "_")
+        return s[:160] if len(s) > 160 else s
+
+    def _extract_skill_name_from_markdown(self, markdown: str) -> str:
+        """`# Skill: ...` 헤더에서 스킬명을 추출."""
+        if not markdown:
+            return ""
+        m = re.search(r"^#\s*Skill:\s*(.+)\s*$", markdown, flags=re.MULTILINE)
+        if m:
+            return " ".join(m.group(1).split()).strip()
+        # fallback: 첫 줄이 '# ' 로 시작하면 그 제목을 사용
+        first = (markdown.splitlines() or [""])[0].strip()
+        if first.startswith("#"):
+            return " ".join(first.lstrip("#").split()).strip()
+        return ""
+
+    def _build_skill_zip_bytes(self, *, skill_name: str, file_name: str, content: str) -> bytes:
+        """`/claude-skills/skills/upload`용 zip 바이트 생성(단일 파일)."""
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # 폴더형 구조(스킬명/파일)로 넣는 것이 가장 호환성이 높음
+            arcname = f"{skill_name}/{file_name}"
+            zf.writestr(arcname, content or "")
+        return bio.getvalue()
+
+    async def _upload_skill_to_claude_skills(
+        self,
+        *,
+        tenant_id: str,
+        skill_name: str,
+        file_name: str,
+        content: str,
+    ) -> bool:
+        """
+        Claude Skills 서비스에 스킬 파일을 업로드합니다.
+        - 1차: PUT /skills/{skill}/files/{file} (UI의 putSkillFile과 동일)
+        - 2차(폴백): POST /skills/upload (zip + tenant_id)
+        """
+        base = (self.claude_skills_base_url or "").rstrip("/")
+        if not base:
+            return False
+
+        client = await self._get_http_client()
+        safe_skill = self._normalize_skill_key(skill_name)
+        safe_file = self._normalize_skill_key(file_name) or "generated.skill.md"
+
+        # 1) file PUT
+        try:
+            put_url = f"{base}/skills/{quote(safe_skill)}/files/{quote(safe_file)}"
+            resp = await client.put(put_url, json={"content": content or ""})
+            if 200 <= resp.status_code < 300:
+                return True
+            # 404 등은 폴백 시도
+        except Exception as e:
+            logger.warning(f"[WARN] claude-skills PUT failed: skill={safe_skill!r} err={e}")
+
+        # 2) upload zip (UI의 uploadSkills와 동일한 엔드포인트)
+        try:
+            zip_bytes = self._build_skill_zip_bytes(skill_name=safe_skill, file_name=safe_file, content=content)
+            files = {"file": (f"{safe_skill}.zip", zip_bytes, "application/zip")}
+            data = {"tenant_id": tenant_id}
+            upload_url = f"{base}/skills/upload"
+            resp = await client.post(upload_url, data=data, files=files)
+            if 200 <= resp.status_code < 300:
+                return True
+            logger.warning(
+                f"[WARN] claude-skills upload failed: status={resp.status_code} body={(resp.text or '')[:300]}"
+            )
+        except Exception as e:
+            logger.warning(f"[WARN] claude-skills upload exception: skill={safe_skill!r} err={e}")
+
+        return False
+
+    async def _sync_skills_to_supabase(
+        self,
+        *,
+        tenant_id: str,
+        skill_names: List[str],
+        agent_user_ids: Set[str],
+    ) -> None:
+        """Supabase에 skills/agent_skills를 동기화(스키마 차이를 고려해 best-effort)."""
+        if not self.supabase_client:
+            return
+
+        normalized_skills = [self._normalize_skill_key(s) for s in (skill_names or []) if str(s or "").strip()]
+        normalized_skills = [s for s in normalized_skills if s]
+        if not normalized_skills:
+            return
+
+        # A) users.skills 업데이트 + agent_skills upsert
+        for uid in sorted({str(x).strip() for x in (agent_user_ids or set()) if str(x).strip()}):
+            try:
+                # agent 여부 확인(아니면 스킵)
+                ures = (
+                    self.supabase_client.table("users")
+                    .select("id, tenant_id, is_agent, skills")
+                    .eq("id", uid)
+                    .eq("tenant_id", tenant_id)
+                    .execute()
+                )
+                row = (ures.data[0] if getattr(ures, "data", None) else None) if ures else None
+                if not isinstance(row, dict) or row.get("is_agent") is not True:
+                    continue
+
+                current = str(row.get("skills") or "")
+                existing = [s.strip() for s in current.split(",") if s.strip()]
+                merged = list(dict.fromkeys(existing + normalized_skills))  # preserve order, unique
+                merged_str = ",".join(merged)
+
+                self.supabase_client.table("users").update({"skills": merged_str}).eq("id", uid).eq(
+                    "tenant_id", tenant_id
+                ).execute()
+
+                # agent_skills: best-effort insert (ignore duplicates)
+                for s in normalized_skills:
+                    try:
+                        self.supabase_client.table("agent_skills").insert(
+                            {"user_id": uid, "tenant_id": tenant_id, "skill_name": s}
+                        ).execute()
+                    except Exception:
+                        # pk 충돌/스키마 차이 등은 무시
+                        pass
+            except Exception as e:
+                logger.warning(f"[WARN] sync users/agent_skills failed: user_id={uid} err={e}")
+
+        # B) tenants.skills 동기화(테넌트 스키마가 환경마다 다를 수 있어 best-effort)
+        try:
+            tres = self.supabase_client.table("tenants").select("*").eq("id", tenant_id).execute()
+            trow = (tres.data[0] if getattr(tres, "data", None) else None) if tres else None
+            if isinstance(trow, dict) and ("skills" in trow):
+                current = str(trow.get("skills") or "")
+                existing = [s.strip() for s in current.split(",") if s.strip()]
+                merged = list(dict.fromkeys(existing + normalized_skills))
+                self.supabase_client.table("tenants").update({"skills": ",".join(merged)}).eq("id", tenant_id).execute()
+        except Exception:
+            # tenants.skills 미존재 등은 무시
+            pass
 
     # -----------------------------------------------------------------------
     # Form generation + saving (B안: proc_def 저장 후 폼 생성/저장)
@@ -5071,6 +5228,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             saved_processes = []
             all_bpmn_xmls = {}  # proc_def_id -> bpmn_xml 매핑
             total_bpmn = len(extracted_by_proc_id)
+            agent_user_ids_for_skill_sync: Set[str] = set()
             
             logger.info(f"[DEBUG] extracted_by_proc_id keys: {list(extracted_by_proc_id.keys())}")
             
@@ -5104,6 +5262,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
                 elements_model = generated.get("elements_model") or {}
                 proc_json = generated.get("definition") or {}
+
+                # NEW: proc_def.definition에 "추출에 사용된 Neo4j proc_id"를 저장
+                # - 프론트에서 실제 Neo4j 그래프(노드/관계)를 조회할 때 사용
+                try:
+                    ex = proc_json.get("extraction")
+                    if not isinstance(ex, dict):
+                        ex = {}
+                    ex["source"] = "pdf2bpmn"
+                    ex["neo4j_proc_id"] = str(proc_id)
+                    proc_json["extraction"] = ex
+                except Exception:
+                    pass
                 
                 # proc_def_id: UUID (already forced inside _generate_processgpt_definition_and_bpmn)
                 proc_def_id = str(proc_json.get("processDefinitionId") or elements_model.get("processDefinitionId") or "").strip()
@@ -5234,6 +5404,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "name": process_name,
                     "bpmn_xml": all_bpmn_xmls.get(proc_def_id, "")  # 최종 XML(없으면 빈 문자열)
                 })
+
+                # 스킬 매핑용: activity에 매핑된 agent user_id 수집(best-effort)
+                try:
+                    acts = proc_json.get("activities") or []
+                    if isinstance(acts, list):
+                        for a in acts:
+                            if isinstance(a, dict):
+                                aid = str(a.get("agent") or "").strip()
+                                if aid:
+                                    agent_user_ids_for_skill_sync.add(aid)
+                except Exception:
+                    pass
                 
                 # 진행 이벤트 (XML 포함)
                 await self._send_progress_event(
@@ -5250,6 +5432,49 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 10. 최종 결과 구성 (saved_processes에는 이미 bpmn_xml 포함됨)
             actual_count = len(saved_processes)
             logger.info(f"[DEBUG] Actual saved process count: {actual_count}")
+
+            # 10.5 NEW: 생성된 스킬을 Claude Skills 서비스에 업로드하고 Supabase에 동기화
+            # - 워크플로우에서 만든 skill_docs(markdown)를 제품이 쓰는 스킬 저장소로 등록
+            try:
+                skill_docs: Dict[str, str] = state.get("skill_docs") or {}
+                if isinstance(skill_docs, dict) and skill_docs:
+                    await self._send_progress_event(
+                        event_queue, context_id, task_id, job_id,
+                        f"[SKILL] 생성된 스킬({len(skill_docs)}) 업로드/동기화를 시작합니다...",
+                        "tool_usage_started", 97,
+                        {"skill_count": len(skill_docs)},
+                    )
+
+                    uploaded: List[str] = []
+                    for md in skill_docs.values():
+                        if not isinstance(md, str) or not md.strip():
+                            continue
+                        sname = self._extract_skill_name_from_markdown(md) or "generated-skill"
+                        safe = self._normalize_skill_key(sname) or "generated-skill"
+                        ok = await self._upload_skill_to_claude_skills(
+                            tenant_id=tenant_id,
+                            skill_name=safe,
+                            file_name=f"{safe}.skill.md",
+                            content=md,
+                        )
+                        if ok:
+                            uploaded.append(safe)
+
+                    # Supabase sync (best-effort)
+                    await self._sync_skills_to_supabase(
+                        tenant_id=tenant_id,
+                        skill_names=uploaded,
+                        agent_user_ids=agent_user_ids_for_skill_sync,
+                    )
+
+                    await self._send_progress_event(
+                        event_queue, context_id, task_id, job_id,
+                        f"[SKILL] 스킬 업로드/동기화 완료: {len(uploaded)}/{len(skill_docs)}",
+                        "tool_usage_finished", 99,
+                        {"skills_uploaded": uploaded, "agents_updated": len(agent_user_ids_for_skill_sync)},
+                    )
+            except Exception as e:
+                logger.warning(f"[WARN] skill upload/sync stage failed: {e}")
             
             completed_message = (
                 "[COMPLETED] PDF2BPMN 변환 완료: 문서에서 프로세스를 추출하지 못해 생성할 BPMN이 없습니다."

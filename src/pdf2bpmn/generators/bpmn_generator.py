@@ -297,7 +297,7 @@ class BPMNGenerator:
                 {
                     "role": role_name or "",
                     "duration": 5,
-                    "instruction": t.description or "",
+                    "instruction": (getattr(t, "instruction", "") or "").strip() or (t.description or ""),
                     "description": t.description or "",
                     "checkpoints": [],
                     "agent": None,

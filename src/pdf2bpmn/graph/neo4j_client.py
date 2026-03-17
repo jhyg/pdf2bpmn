@@ -99,7 +99,11 @@ class Neo4jClient:
         indexes = [
             # Full-text search indexes
             "CREATE FULLTEXT INDEX process_name_idx IF NOT EXISTS FOR (p:Process) ON EACH [p.name, p.description]",
-            "CREATE FULLTEXT INDEX task_name_idx IF NOT EXISTS FOR (t:Task) ON EACH [t.name, t.description]",
+            "CREATE FULLTEXT INDEX task_name_idx IF NOT EXISTS FOR (t:Task) ON EACH [t.name, t.description, t.instruction]",
+            # Backward-compat note:
+            # - If an older DB already has task_name_idx without instruction, Neo4j won't update it.
+            # - Create an additional index name to ensure instruction becomes searchable.
+            "CREATE FULLTEXT INDEX task_text_idx IF NOT EXISTS FOR (t:Task) ON EACH [t.name, t.description, t.instruction]",
             "CREATE FULLTEXT INDEX role_name_idx IF NOT EXISTS FOR (r:Role) ON EACH [r.name, r.org_unit]",
             "CREATE FULLTEXT INDEX skill_name_idx IF NOT EXISTS FOR (s:Skill) ON EACH [s.name, s.summary]",
             
@@ -273,6 +277,7 @@ class Neo4jClient:
         SET t.name = $name,
             t.task_type = $task_type,
             t.description = $description,
+            t.instruction = $instruction,
             t.order = $order,
             t.version = $version,
             t.created_by = $created_by
@@ -290,6 +295,7 @@ class Neo4jClient:
                 "name": task.name,
                 "task_type": task.task_type.value,
                 "description": task.description,
+                "instruction": getattr(task, "instruction", "") or "",
                 "order": task.order,
                 "version": task.version,
                 "created_by": task.created_by
@@ -833,6 +839,7 @@ class Neo4jClient:
                     name=task_dict.get("name", ""),
                     task_type=TaskType(task_dict.get("task_type", "human")),
                     description=task_dict.get("description", ""),
+                    instruction=task_dict.get("instruction", ""),
                     order=task_dict.get("order", 0)
                 )
                 tasks.append(task)
@@ -1018,6 +1025,140 @@ class Neo4jClient:
                     "condition": record["condition"]
                 })
             return flows
+
+    def get_process_graph_elements(self, proc_id: str) -> dict:
+        """
+        Return a process subgraph as Cytoscape-compatible elements.
+        This is intended for UI visualization of the *actual extracted Neo4j graph*.
+
+        Output:
+          {
+            "process_id": "<proc_id>",
+            "elements": [ {data:{id,...}}, {data:{id,source,target,...}}, ... ],
+            "counts": {"nodes": N, "edges": M}
+          }
+        """
+        detail = self.get_process_with_details(proc_id)
+        if not detail:
+            return None
+
+        proc = detail.get("process") or {}
+        tasks = detail.get("tasks") or []
+        gateways = detail.get("gateways") or []
+        events = detail.get("events") or []
+        roles = detail.get("roles") or []
+        skills = detail.get("skills") or []
+
+        def _node_id(kind: str, raw_id: str) -> str:
+            return f"{kind}:{raw_id}"
+
+        elements: list[dict] = []
+        node_ids: set[str] = set()
+
+        # Nodes
+        p_id = str(proc.get("proc_id") or proc_id)
+        p_node = _node_id("Process", p_id)
+        node_ids.add(p_node)
+        elements.append({"data": {"id": p_node, "type": "Process", "label": proc.get("name") or "Process", **proc}})
+
+        def _add_nodes(kind: str, items: list, id_key: str, label_key: str = "name"):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                rid = str(it.get(id_key) or "").strip()
+                if not rid:
+                    continue
+                nid = _node_id(kind, rid)
+                if nid in node_ids:
+                    continue
+                node_ids.add(nid)
+                label = str(it.get(label_key) or rid)
+                elements.append({"data": {"id": nid, "type": kind, "label": label, **it}})
+
+        _add_nodes("Task", tasks, "task_id")
+        _add_nodes("Gateway", gateways, "gateway_id")
+        _add_nodes("Event", events, "event_id")
+        _add_nodes("Role", roles, "role_id")
+        _add_nodes("Skill", skills, "skill_id")
+
+        # Edges: process containment
+        def _edge(eid: str, source: str, target: str, rel_type: str, extra: dict = None):
+            d = {"id": eid, "source": source, "target": target, "type": rel_type, "label": rel_type}
+            if extra:
+                d.update(extra)
+            elements.append({"data": d})
+
+        for t in tasks:
+            tid = str((t or {}).get("task_id") or "").strip()
+            if tid:
+                _edge(f"HAS_TASK:{p_id}->{tid}", p_node, _node_id("Task", tid), "HAS_TASK")
+        for g in gateways:
+            gid = str((g or {}).get("gateway_id") or "").strip()
+            if gid:
+                _edge(f"HAS_GATEWAY:{p_id}->{gid}", p_node, _node_id("Gateway", gid), "HAS_GATEWAY")
+        for e in events:
+            eid0 = str((e or {}).get("event_id") or "").strip()
+            if eid0:
+                _edge(f"HAS_EVENT:{p_id}->{eid0}", p_node, _node_id("Event", eid0), "HAS_EVENT")
+
+        # Edges: Task -> Role/Skill (actual relations)
+        with self.session() as session:
+            rel_rows = session.run(
+                """
+                MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(t:Task)
+                OPTIONAL MATCH (t)-[:PERFORMED_BY]->(r:Role)
+                OPTIONAL MATCH (t)-[:USES_SKILL]->(s:Skill)
+                RETURN t.task_id as task_id,
+                       collect(DISTINCT r.role_id) as role_ids,
+                       collect(DISTINCT s.skill_id) as skill_ids
+                """,
+                {"proc_id": proc_id},
+            )
+            for r in rel_rows:
+                task_id = str(r.get("task_id") or "").strip()
+                if not task_id:
+                    continue
+                for role_id in (r.get("role_ids") or []):
+                    rid = str(role_id or "").strip()
+                    if rid:
+                        _edge(
+                            f"PERFORMED_BY:{task_id}->{rid}",
+                            _node_id("Task", task_id),
+                            _node_id("Role", rid),
+                            "PERFORMED_BY",
+                        )
+                for skill_id in (r.get("skill_ids") or []):
+                    sid = str(skill_id or "").strip()
+                    if sid:
+                        _edge(
+                            f"USES_SKILL:{task_id}->{sid}",
+                            _node_id("Task", task_id),
+                            _node_id("Skill", sid),
+                            "USES_SKILL",
+                        )
+
+        # Edges: NEXT (sequence) within this process
+        flows = self.get_sequence_flows(proc_id)
+        for f in flows or []:
+            from_type = str(f.get("from_type") or "")
+            to_type = str(f.get("to_type") or "")
+            from_id = str(f.get("from_id") or "").strip()
+            to_id = str(f.get("to_id") or "").strip()
+            if not from_id or not to_id:
+                continue
+            condition = str(f.get("condition") or "").strip()
+            _edge(
+                f"NEXT:{from_type}:{from_id}->{to_type}:{to_id}",
+                _node_id(from_type, from_id),
+                _node_id(to_type, to_id),
+                "NEXT",
+                {"condition": condition, "label": condition or ""},
+            )
+
+        # Basic counts
+        node_count = len([x for x in elements if isinstance(x, dict) and x.get("data", {}).get("source") is None])
+        edge_count = len(elements) - node_count
+        return {"process_id": proc_id, "elements": elements, "counts": {"nodes": node_count, "edges": edge_count}}
     
     def search_similar_by_name(
         self, 

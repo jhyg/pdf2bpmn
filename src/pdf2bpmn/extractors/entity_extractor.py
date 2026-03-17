@@ -66,6 +66,10 @@ For tasks, also identify:
 - task_type: "human" (사람이 수행), "agent" (AI/자동화 가능), "system" (시스템 자동)
 - performer_role: Name of the role that performs this task (IMPORTANT!)
 - parent_process: Name of the process this task belongs to (IMPORTANT!)
+- instruction: **How to perform this task** (태스크 수행 지침, Korean)
+  - Write as a short, actionable step-by-step guide (numbered or bullet list in a single string)
+  - Include inputs/outputs or checkpoints if the text provides them
+  - Keep it concise (3~10 steps). If not enough information, return "".
 - order: Sequential order within the process (1, 2, 3...)
 - next_task: Name of the task that follows this one (if identifiable)
 - previous_task: Name of the task that precedes this one (if identifiable)
@@ -377,6 +381,7 @@ class EntityExtractor:
                 name=task_name,
                 task_type=task_type,
                 description=t.get("description", ""),
+                instruction=t.get("instruction", "") or "",
                 order=task_order
             )
             entities["tasks"].append(task)

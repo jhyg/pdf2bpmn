@@ -80,6 +80,7 @@ cd frontend && npm install && npm run dev
 ```bash
 ./start.sh
 ```
+uv run python pdf2bpmn_agent_server.py
 
 ## Docker로 실행 (권장)
 
