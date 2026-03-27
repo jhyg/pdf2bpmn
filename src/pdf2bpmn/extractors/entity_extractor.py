@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from ..config import Config
 from ..models.entities import (
     Process, Task, Role, Gateway, Event,
-    DMNDecision, DMNRule, TaskType, GatewayType, EventType,
+    DMNDecision, DMNRule, Skill, TaskType, GatewayType, EventType,
     generate_id
 )
 
@@ -24,9 +24,11 @@ class ExtractedEntities(BaseModel):
     events: list[dict] = Field(default_factory=list)
     decisions: list[dict] = Field(default_factory=list)
     rules: list[dict] = Field(default_factory=list)
+    skills: list[dict] = Field(default_factory=list)
     # Relationships
     task_role_mappings: list[dict] = Field(default_factory=list)
     task_process_mappings: list[dict] = Field(default_factory=list)
+    role_skill_mappings: list[dict] = Field(default_factory=list)
     # Sequence flows between tasks
     sequence_flows: list[dict] = Field(default_factory=list)
 
@@ -44,11 +46,13 @@ Analyze the following text and extract:
 5. **Events**: Start/End triggers (요청 접수 시, 신청서 제출 후, 정기적으로, 완료 시)
 6. **Decisions**: Business rules or decision logic (if-then rules)
 7. **Rules**: Specific decision rules (조건-결과 pairs)
+8. **Skills**: Professional know-how/capabilities needed to perform work (전문지식, 노하우, 역량, 기준, 판단법, 점검 방법)
 
 IMPORTANT: Also extract RELATIONSHIPS between entities:
-8. **task_role_mappings**: Which role performs which task
-9. **task_process_mappings**: Which process contains which task
-10. **sequence_flows**: The order/sequence between tasks WITH CONDITIONS (VERY IMPORTANT!)
+9. **task_role_mappings**: Which role performs which task
+10. **task_process_mappings**: Which process contains which task
+11. **role_skill_mappings**: Which role should have which skill
+12. **sequence_flows**: The order/sequence between tasks WITH CONDITIONS (VERY IMPORTANT!)
     - Identify which task comes BEFORE and AFTER another
     - **CONDITIONS GO HERE, NOT IN GATEWAYS**: "승인인 경우", "거부인 경우", "예산 부족 시", "금액 100만원 이상" etc.
     - Look for conditional keywords: "~인 경우", "~면", "~시", "아니면", "그렇지 않으면"
@@ -87,6 +91,14 @@ For decisions:
 - output_data: List of output data items
 - related_role: Role that makes this decision
 
+For skills:
+- name: Clear skill/capability name (e.g., "수질 이상 징후 판독", "약품 투입량 산정")
+- summary: Short summary of the know-how
+- purpose: Why this skill is needed
+- procedure: Optional step list as short strings (if text provides)
+- related_role: Role that mainly uses this skill (optional)
+- related_tasks: Task names that use this skill (optional list)
+
 For task_role_mappings:
 - task_name: Name of the task
 - role_name: Name of the role that performs it
@@ -94,6 +106,10 @@ For task_role_mappings:
 For task_process_mappings:
 - task_name: Name of the task
 - process_name: Name of the parent process
+
+For role_skill_mappings:
+- role_name: Name of the role
+- skill_name: Name of the skill
 
 **For sequence_flows (CRITICAL - CONDITIONS ARE EXTRACTED HERE!):**
 - from_task: Name of the source task (or gateway name like "승인 여부 분기")
@@ -286,11 +302,13 @@ class EntityExtractor:
             "events": [],
             "decisions": [],
             "rules": [],
+            "skills": [],
             "evidences": [],
             # Relationship mappings
             "task_role_map": {},  # task_id -> role_id
             "task_process_map": {},  # task_id -> process_id
             "role_decision_map": {},  # role_id -> [decision_ids]
+            "role_skill_map": {},  # role_id -> [skill_ids]
             "entity_chunk_map": {},  # entity_id -> chunk_id (for evidence)
             # Sequence flows (task ordering)
             "sequence_flows": [],  # list of {from_task_id, to_task_id, condition}
@@ -525,6 +543,52 @@ class EntityExtractor:
             
             if chunk_id:
                 entities["entity_chunk_map"][rule_id] = chunk_id
+
+        # Convert skills with optional role linkage
+        skill_name_to_id = {}
+        for s in extracted.skills:
+            skill_id = generate_id()
+            name = s.get("name", "Skill")
+            procedure = s.get("procedure", [])
+            if not isinstance(procedure, list):
+                procedure = []
+            procedure = [str(x).strip() for x in procedure if str(x).strip()]
+
+            skill = {
+                "skill_id": skill_id,
+                "name": name,
+                "summary": s.get("summary", s.get("description", "")) or "",
+                "purpose": s.get("purpose", s.get("summary", "")) or "",
+                "inputs": s.get("inputs", {}) if isinstance(s.get("inputs"), dict) else {},
+                "outputs": s.get("outputs", {}) if isinstance(s.get("outputs"), dict) else {},
+                "preconditions": s.get("preconditions", []) if isinstance(s.get("preconditions"), list) else [],
+                "procedure": procedure,
+                "exceptions": s.get("exceptions", []) if isinstance(s.get("exceptions"), list) else [],
+                "tools": s.get("tools", []) if isinstance(s.get("tools"), list) else [],
+                "md_path": "",
+            }
+            entities["skills"].append(Skill(**skill))
+            skill_name_to_id[name.lower().strip()] = skill_id
+
+            # Optional direct role link from skill payload
+            related_role = (s.get("related_role") or "").lower().strip()
+            if related_role and related_role in role_name_to_id:
+                role_id = role_name_to_id[related_role]
+                entities["role_skill_map"].setdefault(role_id, []).append(skill_id)
+
+            if chunk_id:
+                entities["entity_chunk_map"][skill_id] = chunk_id
+
+        # Explicit role-skill mappings
+        for mapping in extracted.role_skill_mappings:
+            role_name = (mapping.get("role_name") or "").lower().strip()
+            skill_name = (mapping.get("skill_name") or "").lower().strip()
+            if not role_name or not skill_name:
+                continue
+            role_id = role_name_to_id.get(role_name)
+            skill_id = skill_name_to_id.get(skill_name)
+            if role_id and skill_id:
+                entities["role_skill_map"].setdefault(role_id, []).append(skill_id)
         
         # Build gateway name -> id mapping
         gateway_name_to_id = {}

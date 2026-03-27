@@ -5,7 +5,12 @@ from jinja2 import Template
 from ..models.entities import Skill, Task, TaskType
 
 
-SKILL_TEMPLATE = """# Skill: {{ skill.name }}
+SKILL_TEMPLATE = """---
+name: "{{ skill.name | replace('"', '\\"') }}"
+description: "{{ (skill.summary or skill.purpose or 'Generated skill') | replace('"', '\\"') }}"
+---
+
+# {{ skill.name }}
 
 ## Purpose
 {{ skill.purpose or "이 스킬이 해결하는 업무 목적을 정의합니다." }}

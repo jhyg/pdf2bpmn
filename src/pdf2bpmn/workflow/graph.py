@@ -7,7 +7,7 @@ from ..models.state import GraphState
 from ..models.entities import (
     Process, Task, Role, Gateway, Event, 
     Skill, DMNDecision, DMNRule, Evidence, Ambiguity,
-    AmbiguityStatus, TaskType, generate_id
+    AmbiguityStatus, generate_id
 )
 from ..extractors.pdf_extractor import PDFExtractor
 from ..extractors.entity_extractor import EntityExtractor
@@ -76,8 +76,6 @@ class PDF2BPMNWorkflow:
         print("📑 Segmenting and embedding sections...")
         
         chunks = state.get("reference_chunks", [])
-        documents = state.get("documents", [])
-        doc_id = documents[0].doc_id if documents else ""
         
         # Batch embed chunks (in smaller batches to avoid rate limits)
         batch_size = 50
@@ -88,8 +86,8 @@ class PDF2BPMNWorkflow:
             # Store in Neo4j and link to document
             for chunk in batch:
                 self.neo4j.create_chunk(chunk)
-                if doc_id:
-                    self.neo4j.link_chunk_to_document(chunk.chunk_id, doc_id)
+                if chunk.doc_id:
+                    self.neo4j.link_chunk_to_document(chunk.chunk_id, chunk.doc_id)
         
         return {
             "reference_chunks": chunks,
@@ -107,18 +105,23 @@ class PDF2BPMNWorkflow:
         all_events = []
         all_decisions = []
         all_rules = []
+        all_skills = []
         
         sections = state.get("sections", [])
-        documents = state.get("documents", [])
         chunks = state.get("reference_chunks", [])
-        doc_id = documents[0].doc_id if documents else ""
+        is_multi_doc = len({s.doc_id for s in sections if getattr(s, "doc_id", None)}) > 1
         
         # Create chunk index for linking
-        chunk_by_page = {}
+        chunk_by_doc_page = {}
         for chunk in chunks:
-            if chunk.page not in chunk_by_page:
-                chunk_by_page[chunk.page] = []
-            chunk_by_page[chunk.page].append(chunk)
+            key = (chunk.doc_id, chunk.page)
+            if key not in chunk_by_doc_page:
+                chunk_by_doc_page[key] = []
+            chunk_by_doc_page[key].append(chunk)
+
+        # 문서별 엔티티 컨텍스트 (다중 파일일 때 서로 다른 문서 간 과도한 병합 방지)
+        doc_process_name_to_id = {}
+        doc_role_name_to_id = {}
         
         for section in sections:
             if not section.content or len(section.content.strip()) < 50:
@@ -126,13 +129,19 @@ class PDF2BPMNWorkflow:
             
             # Find relevant chunk for this section (for evidence linking)
             section_chunk_id = ""
-            if section.page_from in chunk_by_page and chunk_by_page[section.page_from]:
-                section_chunk_id = chunk_by_page[section.page_from][0].chunk_id
+            section_doc_id = section.doc_id
+            section_key = (section_doc_id, section.page_from)
+            if section_key in chunk_by_doc_page and chunk_by_doc_page[section_key]:
+                section_chunk_id = chunk_by_doc_page[section_key][0].chunk_id
             
             # Extract entities from section content with existing context
             # 기존 프로세스/역할/태스크 목록을 LLM에 전달하여 동일 엔티티 식별 개선
-            existing_process_names = list(self.process_name_to_id.keys())
-            existing_role_names = list(self.role_name_to_id.keys())
+            if is_multi_doc:
+                existing_process_names = list(doc_process_name_to_id.get(section_doc_id, {}).keys())
+                existing_role_names = list(doc_role_name_to_id.get(section_doc_id, {}).keys())
+            else:
+                existing_process_names = list(self.process_name_to_id.keys())
+                existing_role_names = list(self.role_name_to_id.keys())
             
             # 기존 태스크 정보 수집 (이름, 역할, 프로세스)
             existing_tasks_info = []
@@ -163,10 +172,10 @@ class PDF2BPMNWorkflow:
             # Convert to entity objects with relationships
             entities = self.entity_extractor.convert_to_entities(
                 extracted, 
-                doc_id,
+                section_doc_id,
                 chunk_id=section_chunk_id,
-                existing_processes=self.process_name_to_id,
-                existing_roles=self.role_name_to_id
+                existing_processes=(doc_process_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.process_name_to_id),
+                existing_roles=(doc_role_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.role_name_to_id)
             )
             
             # Collect entities
@@ -177,6 +186,7 @@ class PDF2BPMNWorkflow:
             all_events.extend(entities["events"])
             all_decisions.extend(entities["decisions"])
             all_rules.extend(entities["rules"])
+            all_skills.extend(entities.get("skills", []))
             
             # Accumulate relationship mappings
             self.task_role_map.update(entities.get("task_role_map", {}))
@@ -190,12 +200,23 @@ class PDF2BPMNWorkflow:
                 if role_id not in self.role_decision_map:
                     self.role_decision_map[role_id] = []
                 self.role_decision_map[role_id].extend(decision_ids)
+
+            for role_id, skill_ids in entities.get("role_skill_map", {}).items():
+                if role_id not in self.role_skill_map:
+                    self.role_skill_map[role_id] = []
+                self.role_skill_map[role_id].extend(skill_ids)
             
             # Update name -> ID mappings
             for proc in entities["processes"]:
                 self.process_name_to_id[proc.name.lower()] = proc.proc_id
+                if section_doc_id not in doc_process_name_to_id:
+                    doc_process_name_to_id[section_doc_id] = {}
+                doc_process_name_to_id[section_doc_id][proc.name.lower()] = proc.proc_id
             for role in entities["roles"]:
                 self.role_name_to_id[role.name.lower()] = role.role_id
+                if section_doc_id not in doc_role_name_to_id:
+                    doc_role_name_to_id[section_doc_id] = {}
+                doc_role_name_to_id[section_doc_id][role.name.lower()] = role.role_id
             for task in entities["tasks"]:
                 self.task_name_to_id[task.name.lower()] = task.task_id
         
@@ -205,6 +226,7 @@ class PDF2BPMNWorkflow:
             "roles": all_roles,
             "gateways": all_gateways,
             "events": all_events,
+            "skills": all_skills,
             "dmn_decisions": all_decisions,
             "dmn_rules": all_rules,
             "current_step": "normalize_entities"
@@ -221,22 +243,27 @@ class PDF2BPMNWorkflow:
         all_events = []
         all_decisions = []
         all_rules = []
+        all_skills = []
         
         sections = state.get("sections", [])
-        documents = state.get("documents", [])
         chunks = state.get("reference_chunks", [])
-        doc_id = documents[0].doc_id if documents else ""
+        is_multi_doc = len({s.doc_id for s in sections if getattr(s, "doc_id", None)}) > 1
         
         # Filter valid sections
         valid_sections = [s for s in sections if s.content and len(s.content.strip()) >= 50]
         total_sections = len(valid_sections)
         
         # Create chunk index for linking
-        chunk_by_page = {}
+        chunk_by_doc_page = {}
         for chunk in chunks:
-            if chunk.page not in chunk_by_page:
-                chunk_by_page[chunk.page] = []
-            chunk_by_page[chunk.page].append(chunk)
+            key = (chunk.doc_id, chunk.page)
+            if key not in chunk_by_doc_page:
+                chunk_by_doc_page[key] = []
+            chunk_by_doc_page[key].append(chunk)
+
+        # 문서별 엔티티 컨텍스트 (다중 파일일 때 서로 다른 문서 간 과도한 병합 방지)
+        doc_process_name_to_id = {}
+        doc_role_name_to_id = {}
         
         for i, section in enumerate(valid_sections):
             # Report progress
@@ -250,12 +277,18 @@ class PDF2BPMNWorkflow:
             
             # Find relevant chunk for this section
             section_chunk_id = ""
-            if section.page_from in chunk_by_page and chunk_by_page[section.page_from]:
-                section_chunk_id = chunk_by_page[section.page_from][0].chunk_id
+            section_doc_id = section.doc_id
+            section_key = (section_doc_id, section.page_from)
+            if section_key in chunk_by_doc_page and chunk_by_doc_page[section_key]:
+                section_chunk_id = chunk_by_doc_page[section_key][0].chunk_id
             
             # Extract entities with existing context (프로세스, 역할, 태스크 모두 포함)
-            existing_process_names = list(self.process_name_to_id.keys())
-            existing_role_names = list(self.role_name_to_id.keys())
+            if is_multi_doc:
+                existing_process_names = list(doc_process_name_to_id.get(section_doc_id, {}).keys())
+                existing_role_names = list(doc_role_name_to_id.get(section_doc_id, {}).keys())
+            else:
+                existing_process_names = list(self.process_name_to_id.keys())
+                existing_role_names = list(self.role_name_to_id.keys())
             
             # 기존 태스크 정보 수집 (이름, 역할, 프로세스)
             existing_tasks_info = []
@@ -287,10 +320,10 @@ class PDF2BPMNWorkflow:
                 # Convert to entity objects
                 entities = self.entity_extractor.convert_to_entities(
                     extracted, 
-                    doc_id,
+                    section_doc_id,
                     chunk_id=section_chunk_id,
-                    existing_processes=self.process_name_to_id,
-                    existing_roles=self.role_name_to_id
+                    existing_processes=(doc_process_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.process_name_to_id),
+                    existing_roles=(doc_role_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.role_name_to_id)
                 )
                 
                 # Collect entities
@@ -301,6 +334,7 @@ class PDF2BPMNWorkflow:
                 all_events.extend(entities["events"])
                 all_decisions.extend(entities["decisions"])
                 all_rules.extend(entities["rules"])
+                all_skills.extend(entities.get("skills", []))
                 
                 # Accumulate mappings
                 self.task_role_map.update(entities.get("task_role_map", {}))
@@ -312,12 +346,23 @@ class PDF2BPMNWorkflow:
                     if role_id not in self.role_decision_map:
                         self.role_decision_map[role_id] = []
                     self.role_decision_map[role_id].extend(decision_ids)
+
+                for role_id, skill_ids in entities.get("role_skill_map", {}).items():
+                    if role_id not in self.role_skill_map:
+                        self.role_skill_map[role_id] = []
+                    self.role_skill_map[role_id].extend(skill_ids)
                 
                 # Update name mappings
                 for proc in entities["processes"]:
                     self.process_name_to_id[proc.name.lower()] = proc.proc_id
+                    if section_doc_id not in doc_process_name_to_id:
+                        doc_process_name_to_id[section_doc_id] = {}
+                    doc_process_name_to_id[section_doc_id][proc.name.lower()] = proc.proc_id
                 for role in entities["roles"]:
                     self.role_name_to_id[role.name.lower()] = role.role_id
+                    if section_doc_id not in doc_role_name_to_id:
+                        doc_role_name_to_id[section_doc_id] = {}
+                    doc_role_name_to_id[section_doc_id][role.name.lower()] = role.role_id
                 for task in entities["tasks"]:
                     self.task_name_to_id[task.name.lower()] = task.task_id
                     
@@ -331,6 +376,7 @@ class PDF2BPMNWorkflow:
             "roles": all_roles,
             "gateways": all_gateways,
             "events": all_events,
+            "skills": all_skills,
             "dmn_decisions": all_decisions,
             "dmn_rules": all_rules,
             "current_step": "normalize_entities"
@@ -346,6 +392,7 @@ class PDF2BPMNWorkflow:
         gateways = state.get("gateways", [])
         events = state.get("events", [])
         decisions = state.get("dmn_decisions", [])
+        skills = state.get("skills", [])
         
         # 1. 먼저 프로세스 병합 (같은 이름의 프로세스를 하나로)
         unique_processes, process_id_mapping = self._merge_duplicate_processes(processes)
@@ -372,11 +419,13 @@ class PDF2BPMNWorkflow:
         
         # Deduplicate decisions
         unique_decisions = self._deduplicate_entities(decisions, "Decision")
+        unique_skills = self._deduplicate_entities(skills, "Skill")
         
         print(f"   Processes: {len(processes)} → {len(unique_processes)} (merged {len(processes) - len(unique_processes)})")
         print(f"   Tasks: {len(tasks)} → {len(unique_tasks)}")
         print(f"   Roles: {len(roles)} → {len(unique_roles)}")
         print(f"   Decisions: {len(decisions)} → {len(unique_decisions)}")
+        print(f"   Skills: {len(skills)} → {len(unique_skills)}")
         
         # Store in Neo4j
         for proc in unique_processes:
@@ -396,6 +445,9 @@ class PDF2BPMNWorkflow:
         
         for decision in unique_decisions:
             self.neo4j.create_decision(decision)
+
+        for skill in unique_skills:
+            self.neo4j.create_skill(skill)
         
         for rule in state.get("dmn_rules", []):
             self.neo4j.create_rule(rule)
@@ -408,7 +460,8 @@ class PDF2BPMNWorkflow:
             task_role_map=self.task_role_map,
             task_process_map=self.task_process_map,
             role_decision_map=self.role_decision_map,
-            entity_chunk_map=evidence_map
+            entity_chunk_map=evidence_map,
+            role_skill_map=self.role_skill_map,
         )
         
         # Store gateways for sequence flow creation
@@ -428,6 +481,7 @@ class PDF2BPMNWorkflow:
             "processes": unique_processes,
             "tasks": unique_tasks,
             "roles": unique_roles,
+            "skills": unique_skills,
             "dmn_decisions": unique_decisions,
             "current_step": "detect_ambiguities"
         }
@@ -900,42 +954,27 @@ class PDF2BPMNWorkflow:
         return {"current_step": "generate_skills"}
     
     def generate_skills(self, state: GraphState) -> GraphState:
-        """Node: Generate skill documents for agent tasks."""
+        """Node: Generate skill documents from extracted ontology skills."""
         print("📝 Generating skill documents...")
-        
-        tasks = state.get("tasks", [])
-        roles = state.get("roles", [])
+
+        extracted_skills = state.get("skills", [])
         skills = []
         skill_docs = {}
-        
-        for task in tasks:
-            if task.task_type == TaskType.AGENT:
-                skill, markdown = self.skill_generator.generate_from_task(task)
-                
-                safe_name = "".join(
-                    c if c.isalnum() or c in "._-" else "_" 
-                    for c in task.name
-                )
-                filename = f"{safe_name}.skill.md"
-                filepath = Config.OUTPUT_DIR / filename
-                
-                self.skill_generator.save(markdown, str(filepath))
-                skill.md_path = str(filepath)
-                skill_docs[task.task_id] = markdown
-                
-                self.neo4j.create_skill(skill)
-                self.neo4j.link_task_to_skill(task.task_id, skill.skill_id)
-                
-                # Link skill to role if task has a role
-                if task.task_id in self.task_role_map:
-                    role_id = self.task_role_map[task.task_id]
-                    self.neo4j.link_role_to_skill(role_id, skill.skill_id)
-                    
-                    if role_id not in self.role_skill_map:
-                        self.role_skill_map[role_id] = []
-                    self.role_skill_map[role_id].append(skill.skill_id)
-                
-                skills.append(skill)
+
+        for skill in extracted_skills:
+            markdown = self.skill_generator.generate(skill)
+
+            safe_name = "".join(
+                c if c.isalnum() or c in "._-" else "_"
+                for c in (skill.name or "skill")
+            )
+            filename = f"{safe_name}.skill.md"
+            filepath = Config.OUTPUT_DIR / filename
+
+            self.skill_generator.save(markdown, str(filepath))
+            skill.md_path = str(filepath)
+            skill_docs[skill.skill_id] = markdown
+            skills.append(skill)
         
         print(f"   Generated {len(skills)} skill documents")
         

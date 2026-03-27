@@ -19,6 +19,7 @@ class Neo4jClient:
         "Process",
         "Task",
         "Role",
+        "Agent",
         "Gateway",
         "Event",
         "Skill",
@@ -80,6 +81,7 @@ class Neo4jClient:
             "CREATE CONSTRAINT proc_id IF NOT EXISTS FOR (p:Process) REQUIRE p.proc_id IS UNIQUE",
             "CREATE CONSTRAINT task_id IF NOT EXISTS FOR (t:Task) REQUIRE t.task_id IS UNIQUE",
             "CREATE CONSTRAINT role_id IF NOT EXISTS FOR (r:Role) REQUIRE r.role_id IS UNIQUE",
+            "CREATE CONSTRAINT agent_id IF NOT EXISTS FOR (a:Agent) REQUIRE a.agent_id IS UNIQUE",
             "CREATE CONSTRAINT gateway_id IF NOT EXISTS FOR (g:Gateway) REQUIRE g.gateway_id IS UNIQUE",
             "CREATE CONSTRAINT event_id IF NOT EXISTS FOR (e:Event) REQUIRE e.event_id IS UNIQUE",
             
@@ -105,6 +107,7 @@ class Neo4jClient:
             # - Create an additional index name to ensure instruction becomes searchable.
             "CREATE FULLTEXT INDEX task_text_idx IF NOT EXISTS FOR (t:Task) ON EACH [t.name, t.description, t.instruction]",
             "CREATE FULLTEXT INDEX role_name_idx IF NOT EXISTS FOR (r:Role) ON EACH [r.name, r.org_unit]",
+            "CREATE FULLTEXT INDEX agent_name_idx IF NOT EXISTS FOR (a:Agent) ON EACH [a.name, a.role]",
             "CREATE FULLTEXT INDEX skill_name_idx IF NOT EXISTS FOR (s:Skill) ON EACH [s.name, s.summary]",
             
             # Vector index for embeddings (Neo4j 5.11+)
@@ -547,6 +550,51 @@ class Neo4jClient:
         """
         with self.session() as session:
             session.run(query, {"role_id": role_id, "skill_id": skill_id})
+
+    def create_agent(self, agent_id: str, name: str = "", role: str = "", tenant_id: str = ""):
+        """Create or update an Agent node."""
+        query = """
+        MERGE (a:Agent {agent_id: $agent_id})
+        SET a.name = $name,
+            a.role = $role,
+            a.tenant_id = $tenant_id
+        RETURN a.agent_id
+        """
+        with self.session() as session:
+            session.run(
+                query,
+                {
+                    "agent_id": agent_id,
+                    "name": name or "",
+                    "role": role or "",
+                    "tenant_id": tenant_id or "",
+                },
+            )
+
+    def link_role_to_agent_in_process(self, proc_id: str, role_name: str, agent_id: str):
+        """Link process role to assigned agent by role name."""
+        query = """
+        MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(:Task)-[:PERFORMED_BY]->(r:Role)
+        WHERE toLower(trim(r.name)) = toLower(trim($role_name))
+        MATCH (a:Agent {agent_id: $agent_id})
+        MERGE (r)-[:ASSIGNED_AGENT]->(a)
+        """
+        with self.session() as session:
+            session.run(
+                query,
+                {"proc_id": proc_id, "role_name": role_name or "", "agent_id": agent_id},
+            )
+
+    def link_agent_to_skill_by_name(self, agent_id: str, skill_name: str):
+        """Link agent to skill by exact skill name."""
+        query = """
+        MATCH (a:Agent {agent_id: $agent_id})
+        MATCH (s:Skill)
+        WHERE toLower(trim(s.name)) = toLower(trim($skill_name))
+        MERGE (a)-[:USES_SKILL]->(s)
+        """
+        with self.session() as session:
+            session.run(query, {"agent_id": agent_id, "skill_name": skill_name or ""})
     
     def link_role_to_decision(self, role_id: str, decision_id: str):
         """Create MAKES_DECISION relationship between Role and DMNDecision."""
@@ -720,15 +768,26 @@ class Neo4jClient:
                     except:
                         continue
             
-            # Role -> Skill (HAS_SKILL)
-            if role_skill_map:
-                for role_id, skill_ids in role_skill_map.items():
-                    for skill_id in skill_ids:
-                        session.run("""
-                            MATCH (r:Role {role_id: $role_id})
+            # Process -> Skill (HAS_SKILL): derived from Task->Role and Task->Process mappings
+            if role_skill_map and task_role_map and task_process_map:
+                created = set()
+                for task_id, role_id in task_role_map.items():
+                    proc_id = task_process_map.get(task_id)
+                    if not proc_id:
+                        continue
+                    for skill_id in role_skill_map.get(role_id, []):
+                        key = (proc_id, skill_id)
+                        if key in created:
+                            continue
+                        created.add(key)
+                        session.run(
+                            """
+                            MATCH (p:Process {proc_id: $proc_id})
                             MATCH (s:Skill {skill_id: $skill_id})
-                            MERGE (r)-[:HAS_SKILL]->(s)
-                        """, {"role_id": role_id, "skill_id": skill_id})
+                            MERGE (p)-[:HAS_SKILL]->(s)
+                            """,
+                            {"proc_id": proc_id, "skill_id": skill_id},
+                        )
     
     # ==================== Query Operations ====================
     
@@ -751,25 +810,43 @@ class Neo4jClient:
         OPTIONAL MATCH (p)-[:HAS_GATEWAY]->(g:Gateway)
         OPTIONAL MATCH (p)-[:HAS_EVENT]->(e:Event)
         OPTIONAL MATCH (t)-[:PERFORMED_BY]->(r:Role)
-        OPTIONAL MATCH (t)-[:USES_SKILL]->(s:Skill)
+        OPTIONAL MATCH (r)-[:ASSIGNED_AGENT]->(a:Agent)
+        OPTIONAL MATCH (a)-[:USES_SKILL]->(as:Skill)
+        OPTIONAL MATCH (p)-[:HAS_SKILL]->(ps:Skill)
         RETURN p {.*} as process,
                collect(DISTINCT t {.*}) as tasks,
                collect(DISTINCT g {.*}) as gateways,
                collect(DISTINCT e {.*}) as events,
                collect(DISTINCT r {.*}) as roles,
-               collect(DISTINCT s {.*}) as skills
+               collect(DISTINCT a {.*}) as agents,
+               collect(DISTINCT as {.*}) as agent_skills,
+               collect(DISTINCT ps {.*}) as process_skills
         """
         with self.session() as session:
             result = session.run(query, {"proc_id": proc_id})
             record = result.single()
             if record:
+                raw_skills = []
+                raw_skills.extend(record["agent_skills"] or [])
+                raw_skills.extend(record["process_skills"] or [])
+                dedup_skills = []
+                seen_skill_ids = set()
+                for s in raw_skills:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = str(s.get("skill_id") or "").strip()
+                    if not sid or sid in seen_skill_ids:
+                        continue
+                    seen_skill_ids.add(sid)
+                    dedup_skills.append(s)
                 return {
                     "process": record["process"],
                     "tasks": record["tasks"],
                     "gateways": record["gateways"],
                     "events": record["events"],
                     "roles": record["roles"],
-                    "skills": record["skills"]
+                    "agents": record["agents"],
+                    "skills": dedup_skills,
                 }
             return None
     
@@ -1047,6 +1124,7 @@ class Neo4jClient:
         gateways = detail.get("gateways") or []
         events = detail.get("events") or []
         roles = detail.get("roles") or []
+        agents = detail.get("agents") or []
         skills = detail.get("skills") or []
 
         def _node_id(kind: str, raw_id: str) -> str:
@@ -1079,6 +1157,7 @@ class Neo4jClient:
         _add_nodes("Gateway", gateways, "gateway_id")
         _add_nodes("Event", events, "event_id")
         _add_nodes("Role", roles, "role_id")
+        _add_nodes("Agent", agents, "agent_id")
         _add_nodes("Skill", skills, "skill_id")
 
         # Edges: process containment
@@ -1101,16 +1180,14 @@ class Neo4jClient:
             if eid0:
                 _edge(f"HAS_EVENT:{p_id}->{eid0}", p_node, _node_id("Event", eid0), "HAS_EVENT")
 
-        # Edges: Task -> Role/Skill (actual relations)
+        # Edges: Task -> Role (actual relations)
         with self.session() as session:
             rel_rows = session.run(
                 """
                 MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(t:Task)
                 OPTIONAL MATCH (t)-[:PERFORMED_BY]->(r:Role)
-                OPTIONAL MATCH (t)-[:USES_SKILL]->(s:Skill)
                 RETURN t.task_id as task_id,
-                       collect(DISTINCT r.role_id) as role_ids,
-                       collect(DISTINCT s.skill_id) as skill_ids
+                       collect(DISTINCT r.role_id) as role_ids
                 """,
                 {"proc_id": proc_id},
             )
@@ -1127,14 +1204,68 @@ class Neo4jClient:
                             _node_id("Role", rid),
                             "PERFORMED_BY",
                         )
-                for skill_id in (r.get("skill_ids") or []):
+
+            role_agent_rows = session.run(
+                """
+                MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(:Task)-[:PERFORMED_BY]->(r:Role)
+                OPTIONAL MATCH (r)-[:ASSIGNED_AGENT]->(a:Agent)
+                RETURN r.role_id as role_id, collect(DISTINCT a.agent_id) as agent_ids
+                """,
+                {"proc_id": proc_id},
+            )
+            for row in role_agent_rows:
+                rid = str(row.get("role_id") or "").strip()
+                if not rid:
+                    continue
+                for agent_id in (row.get("agent_ids") or []):
+                    aid = str(agent_id or "").strip()
+                    if aid:
+                        _edge(
+                            f"ASSIGNED_AGENT:{rid}->{aid}",
+                            _node_id("Role", rid),
+                            _node_id("Agent", aid),
+                            "ASSIGNED_AGENT",
+                        )
+
+            agent_skill_rows = session.run(
+                """
+                MATCH (p:Process {proc_id: $proc_id})-[:HAS_TASK]->(:Task)-[:PERFORMED_BY]->(:Role)-[:ASSIGNED_AGENT]->(a:Agent)
+                OPTIONAL MATCH (a)-[:USES_SKILL]->(s:Skill)
+                RETURN a.agent_id as agent_id, collect(DISTINCT s.skill_id) as skill_ids
+                """,
+                {"proc_id": proc_id},
+            )
+            for row in agent_skill_rows:
+                aid = str(row.get("agent_id") or "").strip()
+                if not aid:
+                    continue
+                for skill_id in (row.get("skill_ids") or []):
                     sid = str(skill_id or "").strip()
                     if sid:
                         _edge(
-                            f"USES_SKILL:{task_id}->{sid}",
-                            _node_id("Task", task_id),
+                            f"USES_SKILL:Agent:{aid}->Skill:{sid}",
+                            _node_id("Agent", aid),
                             _node_id("Skill", sid),
                             "USES_SKILL",
+                        )
+
+            process_skill_rows = session.run(
+                """
+                MATCH (p:Process {proc_id: $proc_id})-[:HAS_SKILL]->(s:Skill)
+                RETURN collect(DISTINCT s.skill_id) as skill_ids
+                """,
+                {"proc_id": proc_id},
+            )
+            ps_record = process_skill_rows.single() if process_skill_rows else None
+            if ps_record:
+                for skill_id in (ps_record.get("skill_ids") or []):
+                    sid = str(skill_id or "").strip()
+                    if sid:
+                        _edge(
+                            f"HAS_SKILL:Process:{p_id}->Skill:{sid}",
+                            _node_id("Process", p_id),
+                            _node_id("Skill", sid),
+                            "HAS_SKILL",
                         )
 
         # Edges: NEXT (sequence) within this process

@@ -20,7 +20,7 @@ import traceback
 import xml.etree.ElementTree as ET
 import sys
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse, quote
+from urllib.parse import urlparse, urlunparse
 import io
 import zipfile
 
@@ -353,6 +353,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         """`# Skill: ...` 헤더에서 스킬명을 추출."""
         if not markdown:
             return ""
+        # preferred: YAML frontmatter name
+        m = re.search(r"^---\s*\n[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---\s*$", markdown, flags=re.MULTILINE)
+        if m:
+            return " ".join(m.group(1).strip().strip("\"'").split()).strip()
         m = re.search(r"^#\s*Skill:\s*(.+)\s*$", markdown, flags=re.MULTILINE)
         if m:
             return " ".join(m.group(1).split()).strip()
@@ -362,12 +366,53 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             return " ".join(first.lstrip("#").split()).strip()
         return ""
 
+    def _match_skill_score_for_activity(self, activity: Dict[str, Any], skill_meta: Dict[str, Any]) -> float:
+        """Activity와 skill 메타 간의 단순 키워드 매칭 점수(0~1)."""
+        a_text = " ".join(
+            str(x or "")
+            for x in (
+                activity.get("name"),
+                activity.get("role"),
+                activity.get("instruction"),
+                activity.get("description"),
+                activity.get("tool"),
+            )
+        )
+        s_text = " ".join(
+            str(x or "")
+            for x in (
+                skill_meta.get("name"),
+                skill_meta.get("summary"),
+                skill_meta.get("purpose"),
+                skill_meta.get("procedure_text"),
+            )
+        )
+        a_norm = self._normalize_text_key(a_text)
+        s_norm = self._normalize_text_key(s_text)
+        if not a_norm or not s_norm:
+            return 0.0
+
+        # direct containment gives strong signal
+        if a_norm in s_norm or s_norm in a_norm:
+            return 0.95
+
+        # token overlap score
+        a_tokens = {t for t in a_norm.split() if len(t) >= 2}
+        s_tokens = {t for t in s_norm.split() if len(t) >= 2}
+        if not a_tokens or not s_tokens:
+            return 0.0
+        overlap = a_tokens & s_tokens
+        if not overlap:
+            return 0.0
+        denom = max(len(a_tokens), 1)
+        return min(0.9, len(overlap) / denom)
+
     def _build_skill_zip_bytes(self, *, skill_name: str, file_name: str, content: str) -> bytes:
-        """`/claude-skills/skills/upload`용 zip 바이트 생성(단일 파일)."""
+        """`/skills/upload`용 zip 바이트 생성(내부에 반드시 SKILL.md 포함)."""
         bio = io.BytesIO()
         with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            # 폴더형 구조(스킬명/파일)로 넣는 것이 가장 호환성이 높음
-            arcname = f"{skill_name}/{file_name}"
+            # backend parser requirement: archive must contain SKILL.md
+            arcname = f"{skill_name}/SKILL.md"
             zf.writestr(arcname, content or "")
         return bio.getvalue()
 
@@ -381,8 +426,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     ) -> bool:
         """
         Claude Skills 서비스에 스킬 파일을 업로드합니다.
-        - 1차: PUT /skills/{skill}/files/{file} (UI의 putSkillFile과 동일)
-        - 2차(폴백): POST /skills/upload (zip + tenant_id)
+        - POST /skills/upload (zip + tenant_id) 를 기본 경로로 사용
+        - 서버는 zip 내부에 SKILL.md가 있어야 스킬로 인식합니다.
         """
         base = (self.claude_skills_base_url or "").rstrip("/")
         if not base:
@@ -390,19 +435,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         client = await self._get_http_client()
         safe_skill = self._normalize_skill_key(skill_name)
-        safe_file = self._normalize_skill_key(file_name) or "generated.skill.md"
+        safe_file = "SKILL.md"
 
-        # 1) file PUT
-        try:
-            put_url = f"{base}/skills/{quote(safe_skill)}/files/{quote(safe_file)}"
-            resp = await client.put(put_url, json={"content": content or ""})
-            if 200 <= resp.status_code < 300:
-                return True
-            # 404 등은 폴백 시도
-        except Exception as e:
-            logger.warning(f"[WARN] claude-skills PUT failed: skill={safe_skill!r} err={e}")
-
-        # 2) upload zip (UI의 uploadSkills와 동일한 엔드포인트)
+        # upload zip (UI의 uploadSkills와 동일한 엔드포인트)
         try:
             zip_bytes = self._build_skill_zip_bytes(skill_name=safe_skill, file_name=safe_file, content=content)
             files = {"file": (f"{safe_skill}.zip", zip_bytes, "application/zip")}
@@ -1416,38 +1451,160 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         result = {
             "pdf_url": "",
             "pdf_name": "",
+            "pdf_urls": [],
+            "pdf_names": [],
+            "input_files": [],
             "description": "",
             "raw_query": query
         }
+
+        def _extract_json_object_after_marker(text: str, marker: str) -> Optional[Dict[str, Any]]:
+            idx = text.find(marker)
+            if idx < 0:
+                return None
+            start = text.find("{", idx + len(marker))
+            if start < 0:
+                return None
+
+            depth = 0
+            in_str = False
+            escaped = False
+            end = -1
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+
+            if end < 0:
+                return None
+            try:
+                return json.loads(text[start:end + 1])
+            except Exception:
+                return None
+
+        def _normalize_files_from_input(data: Dict[str, Any]) -> List[Dict[str, str]]:
+            files: List[Dict[str, str]] = []
+
+            def _pick_url(item: Dict[str, Any]) -> str:
+                return str(
+                    item.get("fullPath")
+                    or item.get("publicUrl")
+                    or item.get("fileUrl")
+                    or item.get("url")
+                    or item.get("path")
+                    or item.get("pdf_url")
+                    or item.get("pdf_file_url")
+                    or ""
+                ).strip()
+
+            def _pick_name(item: Dict[str, Any]) -> str:
+                return str(
+                    item.get("originalFileName")
+                    or item.get("fileName")
+                    or item.get("name")
+                    or item.get("pdf_name")
+                    or item.get("pdf_file_name")
+                    or ""
+                ).strip()
+
+            def _append_candidate(candidate: Any):
+                if isinstance(candidate, dict):
+                    u = _pick_url(candidate)
+                    if not u:
+                        return
+                    files.append(
+                        {
+                            "url": u,
+                            "name": _pick_name(candidate),
+                        }
+                    )
+                    return
+                if isinstance(candidate, str) and candidate.strip():
+                    files.append({"url": candidate.strip(), "name": ""})
+
+            # 단일 파일 호환 키
+            for key in ("file", "pdf_file", "attachment"):
+                if key in data:
+                    _append_candidate(data.get(key))
+
+            # 다중 파일 키
+            for key in ("files", "pdf_files", "attachments", "uploaded_files"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        _append_candidate(item)
+
+            # 최상위 키 자체가 파일 정보를 담는 경우
+            top_url = _pick_url(data)
+            if top_url:
+                files.append({"url": top_url, "name": _pick_name(data)})
+
+            # dedupe by URL
+            deduped: List[Dict[str, str]] = []
+            seen: Set[str] = set()
+            for f in files:
+                u = str(f.get("url") or "").strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                deduped.append({"url": u, "name": str(f.get("name") or "").strip()})
+            return deduped
+
+        def _apply_parsed_data(data: Dict[str, Any]):
+            normalized_files = _normalize_files_from_input(data)
+            if normalized_files:
+                result["input_files"] = normalized_files
+                result["pdf_urls"] = [f.get("url", "") for f in normalized_files if f.get("url")]
+                result["pdf_names"] = [f.get("name", "") for f in normalized_files]
+                result["pdf_url"] = result["pdf_urls"][0] if result["pdf_urls"] else ""
+                result["pdf_name"] = result["pdf_names"][0] if result["pdf_names"] else ""
+            else:
+                result["pdf_url"] = data.get("pdf_url", data.get("fileUrl", data.get("pdf_file_url",
+                                    data.get("fullPath", data.get("publicUrl", "")))))
+                result["pdf_name"] = data.get("pdf_name", data.get("fileName", data.get("pdf_file_name",
+                                    data.get("originalFileName", ""))))
+                if result["pdf_url"]:
+                    result["pdf_urls"] = [result["pdf_url"]]
+                    result["pdf_names"] = [result["pdf_name"]]
+                    result["input_files"] = [{"url": result["pdf_url"], "name": result["pdf_name"]}]
+            result["description"] = data.get("description", result.get("description", ""))
         
         # 1. 순수 JSON 형식 파싱 시도
         try:
             if query.strip().startswith('{'):
                 data = json.loads(query)
-                result["pdf_url"] = data.get("pdf_url", data.get("fileUrl", data.get("pdf_file_url", 
-                                    data.get("fullPath", data.get("publicUrl", "")))))
-                result["pdf_name"] = data.get("pdf_name", data.get("fileName", data.get("pdf_file_name",
-                                    data.get("originalFileName", ""))))
-                result["description"] = data.get("description", "")
+                _apply_parsed_data(data)
                 return result
         except json.JSONDecodeError:
             pass
         
         # 2. [InputData] 형식에서 JSON 추출
         if "[InputData]" in query:
-            # [InputData] 다음의 JSON 객체 찾기
-            input_data_match = re.search(r'\[InputData\]\s*(\{[^}]+\})', query, re.DOTALL)
-            if input_data_match:
-                try:
-                    json_str = input_data_match.group(1)
-                    data = json.loads(json_str)
-                    # fullPath, publicUrl, path 순으로 URL 추출
-                    result["pdf_url"] = data.get("fullPath", data.get("publicUrl", data.get("path", "")))
-                    result["pdf_name"] = data.get("originalFileName", data.get("fileName", ""))
-                    logger.info(f"[PARSE] Extracted from [InputData] JSON - URL: {result['pdf_url']}, Name: {result['pdf_name']}")
-                    return result
-                except json.JSONDecodeError as e:
-                    logger.warning(f"[PARSE] Failed to parse [InputData] JSON: {e}")
+            data = _extract_json_object_after_marker(query, "[InputData]")
+            if isinstance(data, dict):
+                _apply_parsed_data(data)
+                logger.info(
+                    "[PARSE] Extracted from [InputData] JSON - "
+                    f"files={len(result.get('input_files') or [])}, "
+                    f"first={result.get('pdf_name') or result.get('pdf_url')}"
+                )
+                return result
             
             # key: value 형식 fallback
             url_match = re.search(r'pdf_file_url[:\s]+([^\s,]+)', query)
@@ -1475,13 +1632,32 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if path_parts:
                 result["pdf_name"] = unquote(path_parts[-1])
 
+        if result["pdf_url"] and not result["pdf_urls"]:
+            result["pdf_urls"] = [result["pdf_url"]]
+        if result["pdf_name"] and not result["pdf_names"]:
+            result["pdf_names"] = [result["pdf_name"]]
+        if result["pdf_urls"] and not result["input_files"]:
+            result["input_files"] = [
+                {"url": u, "name": result["pdf_names"][i] if i < len(result["pdf_names"]) else ""}
+                for i, u in enumerate(result["pdf_urls"])
+            ]
+
         # Docker 환경에서 로컬 Supabase(Storage) URL이 localhost/127.0.0.1로 들어오는 경우 보정
         # - 컨테이너 내부에서 127.0.0.1은 컨테이너 자신이므로, 호스트의 Supabase에 접근하려면 host.docker.internal로 바꿔야 함
-        if result.get("pdf_url") and self._is_running_in_docker():
-            rewritten = self._rewrite_localhost_url(result["pdf_url"], localhost_target="host.docker.internal")
-            if rewritten != result["pdf_url"]:
-                logger.info(f"[PARSE] Rewrote pdf_url for Docker: {result['pdf_url']} -> {rewritten}")
-                result["pdf_url"] = rewritten
+        if self._is_running_in_docker():
+            rewritten_files: List[Dict[str, str]] = []
+            for item in result.get("input_files", []) or []:
+                old_url = str(item.get("url") or "")
+                new_url = self._rewrite_localhost_url(old_url, localhost_target="host.docker.internal")
+                if old_url and new_url != old_url:
+                    logger.info(f"[PARSE] Rewrote file URL for Docker: {old_url} -> {new_url}")
+                rewritten_files.append({"url": new_url or old_url, "name": str(item.get("name") or "")})
+            if rewritten_files:
+                result["input_files"] = rewritten_files
+                result["pdf_urls"] = [f.get("url", "") for f in rewritten_files if f.get("url")]
+                result["pdf_names"] = [f.get("name", "") for f in rewritten_files]
+                result["pdf_url"] = result["pdf_urls"][0] if result["pdf_urls"] else result.get("pdf_url", "")
+                result["pdf_name"] = result["pdf_names"][0] if result["pdf_names"] else result.get("pdf_name", "")
         
         return result
 
@@ -4788,8 +4964,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         logger.info(f"[START] PDF2BPMN task: {user_input[:100] if user_input else 'N/A'}... (job_id: {job_id})")
         
-        temp_download_path: Optional[str] = None
-        temp_pdf_path: Optional[str] = None
+        temp_paths_to_cleanup: Set[str] = set()
         
         try:
             # 2. 작업 시작 이벤트
@@ -4801,8 +4976,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             
             # 3. Query 파싱 (PDF 정보 추출)
             parsed = self._parse_query(user_input or "")
-            pdf_name = parsed.get("pdf_name", "document.pdf")
-            logger.info(f"[INFO] PDF Name: {pdf_name}")
+            input_files = parsed.get("input_files") or []
+            if not input_files:
+                pdf_url_fallback = (parsed.get("pdf_url") or "").strip()
+                if pdf_url_fallback:
+                    input_files = [{"url": pdf_url_fallback, "name": parsed.get("pdf_name") or ""}]
+
+            pdf_name = (
+                (input_files[0].get("name") or "").strip()
+                if input_files
+                else parsed.get("pdf_name", "document.pdf")
+            )
+            logger.info(f"[INFO] Input file count: {len(input_files)}")
             
             # # 4~7. PDF 다운로드/업로드/처리 (주석처리 - 프론트에서 이미 처리됨)
             # pdf_url = parsed.get("pdf_url", "")
@@ -4866,92 +5051,117 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 4. PDF URL 다운로드 및 (필요 시) PDF 변환
             #    - 내부 FastAPI(/api/*) 호출은 제거하고, 워크플로우를 직접 실행합니다.
             # =================================================================
-            pdf_url = parsed.get("pdf_url", "")
-            if not pdf_url:
-                raise Exception("PDF URL이 제공되지 않았습니다. query에 pdf_url을 포함해주세요.")
+            if not input_files:
+                raise Exception("파일 URL이 제공되지 않았습니다. query의 [InputData]에 file/files를 포함해주세요.")
 
-            await self._send_progress_event(
-                event_queue, context_id, task_id, job_id,
-                f"[DOWNLOAD] 파일 다운로드 중: {pdf_name}",
-                "tool_usage_started", 8
-            )
+            pdf_paths_for_workflow: List[str] = []
+            input_file_names: List[str] = []
+            download_errors: List[str] = []
 
-            # 파일 다운로드(헤더/URL/Content-Type 기반 파일명 추정 포함)
-            temp_download_path, inferred_name, inferred_ct = await self._download_file(pdf_url, pdf_name)
-            pdf_name = inferred_name or pdf_name
+            for idx, file_info in enumerate(input_files, start=1):
+                file_url = (file_info.get("url") or "").strip()
+                display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
+                if not file_url:
+                    continue
 
-            # PDF 여부 판별(확장자보다 매직바이트 우선)
-            is_pdf = False
-            try:
-                with open(temp_download_path, "rb") as _f:
-                    is_pdf = (_f.read(6) or b"").startswith(b"%PDF-")
-            except Exception:
-                is_pdf = False
-
-            pdf_path_for_workflow = temp_download_path
-
-            # PDF가 아니면 로컬에서 PDF로 변환
-            if not is_pdf:
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
-                    f"[CONVERT] PDF가 아닌 파일을 PDF로 변환 중: {pdf_name}",
-                    "tool_usage_started", 9
+                    f"[DOWNLOAD] 파일 다운로드 중 ({idx}/{len(input_files)}): {display_name}",
+                    "tool_usage_started", 8
                 )
 
-                # 확장자가 ".pdf"인데 실제 PDF가 아닌 경우(잘못된 힌트/URL) → Content-Type/파일명으로 보정 후 변환
+                temp_download_path: Optional[str] = None
+                temp_pdf_path: Optional[str] = None
                 try:
-                    src_p = Path(temp_download_path)
-                    name_ext = Path(pdf_name).suffix.lower()
-                    if src_p.suffix.lower() == ".pdf":
-                        fixed_ext = ""
-                        if name_ext and name_ext != ".pdf":
-                            fixed_ext = name_ext
-                        else:
-                            ct_map = {
-                                "application/msword": ".doc",
-                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-                                "application/vnd.ms-excel": ".xls",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-                                "application/vnd.ms-powerpoint": ".ppt",
-                                "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-                                "text/plain": ".txt",
-                                "text/csv": ".csv",
-                                "text/html": ".html",
-                                "application/rtf": ".rtf",
-                                "application/vnd.oasis.opendocument.text": ".odt",
-                                "application/vnd.oasis.opendocument.spreadsheet": ".ods",
-                                "application/vnd.oasis.opendocument.presentation": ".odp",
-                            }
-                            fixed_ext = ct_map.get((inferred_ct or "").lower(), "")
-                        if fixed_ext and fixed_ext != ".pdf":
-                            new_path = str(src_p.with_suffix(fixed_ext))
-                            os.replace(temp_download_path, new_path)
-                            temp_download_path = new_path
-                            pdf_name = str(Path(pdf_name).with_suffix(fixed_ext))
-                except Exception:
-                    pass
+                    # 파일 다운로드(헤더/URL/Content-Type 기반 파일명 추정 포함)
+                    temp_download_path, inferred_name, inferred_ct = await self._download_file(file_url, display_name)
+                    temp_paths_to_cleanup.add(temp_download_path)
+                    resolved_name = inferred_name or display_name
 
-                try:
-                    from src.pdf2bpmn.converters.file_to_pdf import convert_to_pdf, FileToPdfError  # type: ignore
-
-                    converted_pdf = convert_to_pdf(str(temp_download_path), str(Path(str(temp_download_path)).parent))
-                    pdf_path_for_workflow = converted_pdf
-                    temp_pdf_path = converted_pdf
-                    pdf_name = Path(converted_pdf).name
-                except FileToPdfError as e:
-                    raise Exception(f"파일을 PDF로 변환하지 못했습니다: {e}")
-                finally:
-                    # 다운로드 원본은 가능하면 정리(변환 산출물과 경로가 다르면)
+                    # PDF 여부 판별(확장자보다 매직바이트 우선)
+                    is_pdf = False
                     try:
-                        if temp_download_path and temp_pdf_path and os.path.abspath(temp_download_path) != os.path.abspath(temp_pdf_path):
-                            if os.path.exists(temp_download_path):
-                                os.unlink(temp_download_path)
+                        with open(temp_download_path, "rb") as _f:
+                            is_pdf = (_f.read(6) or b"").startswith(b"%PDF-")
                     except Exception:
-                        pass
-            else:
-                # PDF인데 확장자가 PDF가 아니면 표시용 이름만 보정
-                if not str(pdf_name).lower().endswith(".pdf"):
-                    pdf_name = str(Path(pdf_name).with_suffix(".pdf"))
+                        is_pdf = False
+
+                    pdf_path_for_workflow = temp_download_path
+
+                    # PDF가 아니면 로컬에서 PDF로 변환
+                    if not is_pdf:
+                        await self._send_progress_event(
+                            event_queue, context_id, task_id, job_id,
+                            f"[CONVERT] PDF 변환 중 ({idx}/{len(input_files)}): {resolved_name}",
+                            "tool_usage_started", 9
+                        )
+
+                        # 확장자가 ".pdf"인데 실제 PDF가 아닌 경우(잘못된 힌트/URL) → Content-Type/파일명으로 보정 후 변환
+                        try:
+                            src_p = Path(temp_download_path)
+                            name_ext = Path(resolved_name).suffix.lower()
+                            if src_p.suffix.lower() == ".pdf":
+                                fixed_ext = ""
+                                if name_ext and name_ext != ".pdf":
+                                    fixed_ext = name_ext
+                                else:
+                                    ct_map = {
+                                        "application/msword": ".doc",
+                                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                                        "application/vnd.ms-excel": ".xls",
+                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                                        "application/vnd.ms-powerpoint": ".ppt",
+                                        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                                        "text/plain": ".txt",
+                                        "text/csv": ".csv",
+                                        "text/html": ".html",
+                                        "application/rtf": ".rtf",
+                                        "application/vnd.oasis.opendocument.text": ".odt",
+                                        "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+                                        "application/vnd.oasis.opendocument.presentation": ".odp",
+                                    }
+                                    fixed_ext = ct_map.get((inferred_ct or "").lower(), "")
+                                if fixed_ext and fixed_ext != ".pdf":
+                                    new_path = str(src_p.with_suffix(fixed_ext))
+                                    os.replace(temp_download_path, new_path)
+                                    temp_paths_to_cleanup.discard(temp_download_path)
+                                    temp_download_path = new_path
+                                    temp_paths_to_cleanup.add(temp_download_path)
+                                    resolved_name = str(Path(resolved_name).with_suffix(fixed_ext))
+                        except Exception:
+                            pass
+
+                        try:
+                            from src.pdf2bpmn.converters.file_to_pdf import convert_to_pdf, FileToPdfError  # type: ignore
+
+                            converted_pdf = convert_to_pdf(
+                                str(temp_download_path),
+                                str(Path(str(temp_download_path)).parent),
+                            )
+                            pdf_path_for_workflow = converted_pdf
+                            temp_pdf_path = converted_pdf
+                            temp_paths_to_cleanup.add(temp_pdf_path)
+                            resolved_name = Path(converted_pdf).name
+                        except FileToPdfError as e:
+                            raise Exception(f"파일을 PDF로 변환하지 못했습니다: {e}")
+                    else:
+                        # PDF인데 확장자가 PDF가 아니면 표시용 이름만 보정
+                        if not str(resolved_name).lower().endswith(".pdf"):
+                            resolved_name = str(Path(resolved_name).with_suffix(".pdf"))
+
+                    pdf_paths_for_workflow.append(str(pdf_path_for_workflow))
+                    input_file_names.append(resolved_name)
+                except Exception as e:
+                    download_errors.append(f"{display_name}: {e}")
+                    logger.warning(f"[WARN] 파일 처리 실패({idx}/{len(input_files)}): {display_name} - {e}")
+
+            if not pdf_paths_for_workflow:
+                raise Exception(
+                    "업로드된 파일을 처리하지 못했습니다: "
+                    + ("; ".join(download_errors) if download_errors else "유효한 파일이 없습니다.")
+                )
+
+            pdf_name = input_file_names[0] if input_file_names else (pdf_name or "document.pdf")
 
             # =================================================================
             # 5. 선행 정리: 기존 프로세스 핵심 라벨만 삭제 (교차 실행 데이터 혼합 방지)
@@ -5049,7 +5259,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
             workflow = PDF2BPMNWorkflow()
             state: Dict[str, Any] = {
-                "pdf_paths": [str(pdf_path_for_workflow)],
+                "pdf_paths": [str(p) for p in pdf_paths_for_workflow],
                 "documents": [],
                 "sections": [],
                 "reference_chunks": [],
@@ -5090,11 +5300,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 try:
                     docs = state.get("documents") or []
                     if docs:
-                        page_count = int(getattr(docs[0], "page_count", 0) or 0)
+                        page_count = sum(int(getattr(d, "page_count", 0) or 0) for d in docs)
                 except Exception:
                     page_count = 0
                 chunk_count = len(state.get("reference_chunks") or [])
-                _enqueue_progress(f"[STEP] PDF 파싱 완료: {page_count}페이지, {chunk_count}개 청크", 28)
+                _enqueue_progress(
+                    f"[STEP] 문서 파싱 완료: 파일 {len(pdf_paths_for_workflow)}개, "
+                    f"총 {page_count}페이지, {chunk_count}개 청크",
+                    28
+                )
 
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
@@ -5229,6 +5443,68 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             all_bpmn_xmls = {}  # proc_def_id -> bpmn_xml 매핑
             total_bpmn = len(extracted_by_proc_id)
             agent_user_ids_for_skill_sync: Set[str] = set()
+            agent_skill_names_for_sync: Dict[str, Set[str]] = {}
+
+            # 온톨로지에서 추출/생성된 스킬 메타(에이전트와 독립 생성)
+            generated_skill_metas: List[Dict[str, Any]] = []
+            for s in (state.get("skills") or []):
+                try:
+                    name = str(getattr(s, "name", "") or "").strip()
+                    if not name:
+                        continue
+                    generated_skill_metas.append(
+                        {
+                            "name": name,
+                            "safe_name": self._normalize_skill_key(name),
+                            "summary": str(getattr(s, "summary", "") or ""),
+                            "purpose": str(getattr(s, "purpose", "") or ""),
+                            "procedure_text": " ".join(getattr(s, "procedure", []) or []),
+                        }
+                    )
+                except Exception:
+                    continue
+
+            def _sync_agent_graph_for_process_sync(
+                neo4j_proc_id: str,
+                role_agent_pairs: List[tuple[str, str]],
+                agent_skill_names: Dict[str, Set[str]],
+            ) -> None:
+                """Runtime assignment 결과를 Neo4j 그래프(Agent 노드/엣지)에 반영."""
+                if not neo4j_proc_id:
+                    return
+                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
+
+                users_by_id = {
+                    str(u.get("id")): u
+                    for u in (self._users or [])
+                    if isinstance(u, dict) and u.get("id")
+                }
+                neo4j = Neo4jClient()
+                try:
+                    # 1) Agent node + Role -> Agent
+                    for role_name, agent_id in role_agent_pairs:
+                        aid = str(agent_id or "").strip()
+                        if not aid:
+                            continue
+                        u = users_by_id.get(aid, {})
+                        neo4j.create_agent(
+                            agent_id=aid,
+                            name=str(u.get("username") or u.get("name") or aid),
+                            role=str(u.get("role") or ""),
+                            tenant_id=str(u.get("tenant_id") or ""),
+                        )
+                        if role_name:
+                            neo4j.link_role_to_agent_in_process(neo4j_proc_id, role_name, aid)
+
+                    # 2) Agent -> Skill (by skill name)
+                    for agent_id, skill_names in (agent_skill_names or {}).items():
+                        aid = str(agent_id or "").strip()
+                        if not aid:
+                            continue
+                        for sk in sorted({str(x).strip() for x in (skill_names or set()) if str(x).strip()}):
+                            neo4j.link_agent_to_skill_by_name(aid, sk)
+                finally:
+                    neo4j.close()
             
             logger.info(f"[DEBUG] extracted_by_proc_id keys: {list(extracted_by_proc_id.keys())}")
             
@@ -5408,12 +5684,39 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # 스킬 매핑용: activity에 매핑된 agent user_id 수집(best-effort)
                 try:
                     acts = proc_json.get("activities") or []
+                    process_role_agent_pairs: List[tuple[str, str]] = []
+                    process_agent_skill_names: Dict[str, Set[str]] = {}
                     if isinstance(acts, list):
                         for a in acts:
                             if isinstance(a, dict):
                                 aid = str(a.get("agent") or "").strip()
+                                role_name = str(a.get("role") or "").strip()
                                 if aid:
                                     agent_user_ids_for_skill_sync.add(aid)
+                                    if role_name:
+                                        process_role_agent_pairs.append((role_name, aid))
+                                    # 생성된 스킬 중에서 activity와 연관성이 높은 것만 에이전트에 할당 후보로 누적
+                                    if generated_skill_metas:
+                                        ranked: List[tuple[float, str]] = []
+                                        for sm in generated_skill_metas:
+                                            score = self._match_skill_score_for_activity(a, sm)
+                                            if score >= 0.35:
+                                                skill_name = str(sm.get("name") or "").strip()
+                                                if skill_name:
+                                                    ranked.append((score, skill_name))
+                                        if ranked:
+                                            ranked.sort(key=lambda x: x[0], reverse=True)
+                                            top_skill_names = [n for _, n in ranked[:5]]
+                                            agent_skill_names_for_sync.setdefault(aid, set()).update(top_skill_names)
+                                            process_agent_skill_names.setdefault(aid, set()).update(top_skill_names)
+
+                    # Neo4j 그래프에 Agent 노드/엣지 반영 (Task->Skill 직접 연결은 사용하지 않음)
+                    await asyncio.to_thread(
+                        _sync_agent_graph_for_process_sync,
+                        str(proc_id),
+                        process_role_agent_pairs,
+                        process_agent_skill_names,
+                    )
                 except Exception:
                     pass
                 
@@ -5454,24 +5757,41 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         ok = await self._upload_skill_to_claude_skills(
                             tenant_id=tenant_id,
                             skill_name=safe,
-                            file_name=f"{safe}.skill.md",
+                            file_name="SKILL.md",
                             content=md,
                         )
                         if ok:
                             uploaded.append(safe)
 
                     # Supabase sync (best-effort)
-                    await self._sync_skills_to_supabase(
-                        tenant_id=tenant_id,
-                        skill_names=uploaded,
-                        agent_user_ids=agent_user_ids_for_skill_sync,
-                    )
+                    uploaded_set = {self._normalize_skill_key(x) for x in uploaded if str(x or "").strip()}
+                    if agent_skill_names_for_sync:
+                        for agent_id, desired_skills in agent_skill_names_for_sync.items():
+                            if not desired_skills:
+                                continue
+                            assigned = [
+                                self._normalize_skill_key(s)
+                                for s in desired_skills
+                                if self._normalize_skill_key(s) in uploaded_set
+                            ]
+                            if not assigned:
+                                # 매칭되는 스킬이 없으면 스킵 (요구사항)
+                                continue
+                            await self._sync_skills_to_supabase(
+                                tenant_id=tenant_id,
+                                skill_names=assigned,
+                                agent_user_ids={agent_id},
+                            )
 
                     await self._send_progress_event(
                         event_queue, context_id, task_id, job_id,
                         f"[SKILL] 스킬 업로드/동기화 완료: {len(uploaded)}/{len(skill_docs)}",
                         "tool_usage_finished", 99,
-                        {"skills_uploaded": uploaded, "agents_updated": len(agent_user_ids_for_skill_sync)},
+                        {
+                            "skills_uploaded": uploaded,
+                            "agents_updated": len(agent_skill_names_for_sync),
+                            "agents_seen": len(agent_user_ids_for_skill_sync),
+                        },
                     )
             except Exception as e:
                 logger.warning(f"[WARN] skill upload/sync stage failed: {e}")
@@ -5487,6 +5807,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "status": "completed",
                 "job_id": job_id,
                 "pdf_name": pdf_name,
+                "pdf_names": input_file_names,
+                "file_count": len(input_file_names),
                 "process_count": actual_count,
                 "saved_processes": saved_processes,  # bpmn_xml 포함
                 "generated_at": datetime.now(timezone.utc).isoformat()
@@ -5502,6 +5824,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             final_artifact_data = {
                 "type": "pdf2bpmn_result",
                 "pdf_name": pdf_name,
+                "pdf_names": input_file_names,
+                "file_count": len(input_file_names),
                 "process_count": actual_count,
                 "saved_processes": saved_processes_summary,  # 요약만
                 "bpmn_xmls": all_bpmn_xmls,  # 모든 XML 내용
@@ -5561,7 +5885,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         finally:
             # 임시 파일 정리
-            for p in [temp_pdf_path, temp_download_path]:
+            for p in list(temp_paths_to_cleanup):
                 if not p:
                     continue
                 try:

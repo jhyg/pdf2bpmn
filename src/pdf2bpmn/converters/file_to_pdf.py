@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import os
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -63,7 +65,21 @@ def _find_soffice() -> Optional[str]:
         p = Path(Config.LIBREOFFICE_PATH)
         if p.exists():
             return str(p)
-    return shutil.which("soffice") or shutil.which("libreoffice")
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+
+    # Windows fallback: common LibreOffice install locations
+    windows_candidates = [
+        Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files\LibreOffice\program\soffice.com"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.com"),
+    ]
+    for c in windows_candidates:
+        if c.exists():
+            return str(c)
+    return None
 
 
 def convert_to_pdf(input_path: str, output_dir: str) -> str:
@@ -115,6 +131,13 @@ def _image_to_pdf(src: Path, out_dir: Path) -> str:
 
 
 def _office_to_pdf(src: Path, out_dir: Path, allow_unknown: bool = False) -> str:
+    # OOXML files are zip-based; fail early with clearer message when extension/content mismatch
+    if src.suffix.lower() in {".xlsx", ".docx", ".pptx"} and not zipfile.is_zipfile(src):
+        raise FileToPdfError(
+            f"파일 확장자({src.suffix})와 실제 파일 포맷이 일치하지 않습니다: {src.name}. "
+            "원본 파일이 손상되었거나 다른 형식 파일이 잘못된 확장자로 업로드되었을 수 있습니다."
+        )
+
     soffice = _find_soffice()
     if not soffice:
         raise FileToPdfError(
@@ -143,8 +166,20 @@ def _office_to_pdf(src: Path, out_dir: Path, allow_unknown: bool = False) -> str
         str(work_dir),
         str(src),
     ]
+    # LibreOffice can fail on Windows when inherited Python env points elsewhere.
+    # Isolate process environment to avoid "Could not find platform independent libraries".
+    run_env = dict(os.environ)
+    run_env.pop("PYTHONHOME", None)
+    run_env.pop("PYTHONPATH", None)
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            env=run_env,
+        )
     except subprocess.TimeoutExpired as e:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise FileToPdfError(f"LibreOffice 변환이 타임아웃되었습니다: {src.name}") from e
