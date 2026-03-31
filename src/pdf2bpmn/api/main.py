@@ -539,13 +539,67 @@ async def get_process_detail(proc_id: str):
 
 
 @app.get("/api/processes/{proc_id}/graph")
-async def get_process_graph(proc_id: str):
+async def get_process_graph(proc_id: str, include_integrated: bool = False):
     """Get the *actual extracted* Neo4j subgraph (nodes + relationships) for a process."""
     neo4j = Neo4jClient()
     try:
         data = neo4j.get_process_graph_elements(proc_id)
         if not data:
             raise HTTPException(404, "Process not found")
+        if include_integrated:
+            data["integrated_graph"] = neo4j.get_latest_integrated_graph_by_proc_id(proc_id)
+        return data
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/processes/{proc_id}/graph/integrated")
+async def get_integrated_graph_by_process(proc_id: str):
+    """Get latest request-level integrated graph associated with this process."""
+    neo4j = Neo4jClient()
+    try:
+        data = neo4j.get_latest_integrated_graph_by_proc_id(proc_id)
+        if not data:
+            raise HTTPException(404, "Integrated graph not found for process")
+        return data
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/graph/runs/{run_id}")
+async def get_request_integrated_graph(run_id: str):
+    """Get request-level integrated graph snapshot."""
+    neo4j = Neo4jClient()
+    try:
+        data = neo4j.get_request_integrated_graph(run_id)
+        if not data:
+            raise HTTPException(404, "Graph run not found")
+        return data
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/graph/runs/{run_id}/processes/{proc_id}")
+async def get_request_process_graph(run_id: str, proc_id: str):
+    """Get per-process graph snapshot for a specific request run."""
+    neo4j = Neo4jClient()
+    try:
+        data = neo4j.get_request_process_graph(run_id, proc_id)
+        if not data:
+            raise HTTPException(404, "Process graph snapshot not found")
+        return data
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/graph/requests/{task_id}")
+async def get_request_integrated_graph_by_task(task_id: str):
+    """Get latest request-level integrated graph snapshot by task_id."""
+    neo4j = Neo4jClient()
+    try:
+        data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
+        if not data:
+            raise HTTPException(404, "Request integrated graph not found")
         return data
     finally:
         neo4j.close()
@@ -830,6 +884,42 @@ async def get_graph_stats():
                 stats["relationships"][key] = result.single()["count"]
             
             return stats
+    finally:
+        neo4j.close()
+
+
+@app.get("/api/graph/full")
+async def get_full_graph(
+    run_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    source: str = "integrated",
+    max_nodes: int = 3000,
+):
+    """
+    Unified full graph endpoint.
+
+    - source=integrated (default):
+      returns request-level integrated graph snapshot.
+      Priority: run_id -> task_id -> latest
+    - source=global:
+      returns current Neo4j process-core full graph.
+    """
+    neo4j = Neo4jClient()
+    try:
+        src = (source or "integrated").strip().lower()
+        if src == "global":
+            data = neo4j.get_full_graph_elements(max_nodes=max_nodes)
+        else:
+            if run_id:
+                data = neo4j.get_request_integrated_graph(run_id)
+            elif task_id:
+                data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
+            else:
+                data = neo4j.get_latest_request_integrated_graph()
+
+            if not data:
+                raise HTTPException(404, "Integrated graph not found")
+        return data
     finally:
         neo4j.close()
 

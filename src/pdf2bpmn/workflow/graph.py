@@ -1,4 +1,5 @@
 """LangGraph workflow definition for PDF to BPMN conversion."""
+import re
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -394,8 +395,13 @@ class PDF2BPMNWorkflow:
         decisions = state.get("dmn_decisions", [])
         skills = state.get("skills", [])
         
-        # 1. 먼저 프로세스 병합 (같은 이름의 프로세스를 하나로)
-        unique_processes, process_id_mapping = self._merge_duplicate_processes(processes)
+        # 1. 먼저 프로세스 병합 (이름 + 내용 유사도 기반)
+        unique_processes, process_id_mapping = self._merge_duplicate_processes(
+            processes,
+            tasks,
+            roles,
+            state.get("reference_chunks", []),
+        )
         
         # 2. 태스크의 process_id를 병합된 프로세스로 업데이트
         tasks = self._update_task_process_ids(tasks, process_id_mapping)
@@ -586,48 +592,358 @@ class PDF2BPMNWorkflow:
                         MERGE (p)-[:HAS_TASK]->(t)
                     """, {"proc_id": default_process_id, "task_id": task.task_id})
     
-    def _merge_duplicate_processes(self, processes: list) -> tuple[list, dict]:
+    def _normalize_process_text(self, value: str) -> str:
+        """Normalize text for process similarity scoring."""
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    def _tokenize_process_text(self, value: str) -> set[str]:
+        """Tokenize process text to simple normalized terms."""
+        norm = self._normalize_process_text(value)
+        if not norm:
+            return set()
+        parts = re.split(r"[^0-9a-zA-Z가-힣]+", norm)
+        tokens = {p for p in parts if len(p) >= 2}
+        # Add compact form to reduce whitespace variation impact.
+        compact = re.sub(r"\s+", "", norm)
+        if len(compact) >= 3:
+            tokens.add(compact)
+        return tokens
+
+    def _char_ngrams(self, value: str, n: int = 3) -> set[str]:
+        """Build character n-gram set for fuzzy narrative similarity."""
+        norm = re.sub(r"\s+", "", self._normalize_process_text(value))
+        if len(norm) < n:
+            return {norm} if norm else set()
+        return {norm[i:i + n] for i in range(len(norm) - n + 1)}
+
+    def _extract_business_keys(self, value: str) -> set[str]:
         """
-        같은 이름의 프로세스를 병합하고, 병합된 프로세스 ID 매핑을 반환.
-        
+        Extract business keys from text (e.g., RQ_BP_XXXX, AA_BB_1234).
+        This uses only content text, not file names.
+        """
+        text = (value or "").upper()
+        keys = set()
+        patterns = [
+            r"\b[A-Z]{1,8}_[A-Z]{1,8}_[A-Z0-9]{2,}\b",
+            r"\b[A-Z]{1,8}_BP_[A-Z0-9]{2,}\b",
+            r"\bBP_[A-Z0-9]{2,}\b",
+        ]
+        for pattern in patterns:
+            for m in re.findall(pattern, text):
+                keys.add(m.strip())
+        return keys
+
+    def _jaccard_similarity(self, left: set[str], right: set[str]) -> float:
+        """Compute Jaccard similarity for two sets."""
+        if not left and not right:
+            return 1.0
+        if not left or not right:
+            return 0.0
+        inter = len(left & right)
+        union = len(left | right)
+        return inter / union if union else 0.0
+
+    def _build_process_signature(
+        self,
+        proc,
+        tasks: list,
+        role_id_to_name: dict[str, str],
+        source_text: str = "",
+    ) -> dict:
+        """Build content signature for process similarity."""
+        proc_tasks = [t for t in tasks if getattr(t, "process_id", "") == proc.proc_id]
+        task_name_tokens = set()
+        role_name_tokens = set()
+        desc_tokens = self._tokenize_process_text(f"{proc.name} {proc.description} {proc.purpose}")
+        narrative_source = [f"{proc.name} {proc.description} {proc.purpose}"]
+        if source_text:
+            narrative_source.append(source_text[:4000])
+        bp_keys = self._extract_business_keys(" ".join(narrative_source))
+
+        for task in proc_tasks:
+            task_name = getattr(task, "name", "") or ""
+            task_desc = getattr(task, "description", "") or ""
+            task_inst = getattr(task, "instruction", "") or ""
+            task_name_tokens.update(self._tokenize_process_text(task_name))
+            task_name_tokens.update(self._tokenize_process_text(task_desc))
+            narrative_source.append(f"{task_name} {task_desc} {task_inst}")
+            bp_keys.update(self._extract_business_keys(f"{task_name} {task_desc} {task_inst}"))
+
+            role_id = self.task_role_map.get(getattr(task, "task_id", ""))
+            role_name = role_id_to_name.get(role_id, "")
+            if role_name:
+                role_name_tokens.update(self._tokenize_process_text(role_name))
+                narrative_source.append(role_name)
+                bp_keys.update(self._extract_business_keys(role_name))
+
+        narrative_text = " ".join(narrative_source)
+        # Sequence-flow conditions also carry strong process identity clues.
+        process_task_ids = {getattr(t, "task_id", "") for t in proc_tasks}
+        flow_texts = []
+        for flow in self.sequence_flows:
+            from_id = flow.get("from_id") or flow.get("from_task_id")
+            to_id = flow.get("to_id") or flow.get("to_task_id")
+            if from_id in process_task_ids or to_id in process_task_ids:
+                cond = (flow.get("condition") or "").strip()
+                if cond:
+                    flow_texts.append(cond)
+        if flow_texts:
+            flow_blob = " ".join(flow_texts[:30])
+            desc_tokens.update(self._tokenize_process_text(flow_blob))
+            narrative_text = f"{narrative_text} {flow_blob}"
+            bp_keys.update(self._extract_business_keys(flow_blob))
+
+        return {
+            "task_tokens": task_name_tokens,
+            "role_tokens": role_name_tokens,
+            "desc_tokens": desc_tokens,
+            "narrative_ngrams": self._char_ngrams(narrative_text, n=3),
+            "bp_keys": bp_keys,
+            "task_count": len(proc_tasks),
+            "name_norm": self._normalize_process_text(getattr(proc, "name", "")),
+        }
+
+    def _process_similarity(self, sig_a: dict, sig_b: dict) -> dict:
+        """
+        Content-based process similarity score.
+        Name similarity is intentionally a weak signal and never the only criterion.
+        """
+        task_sim = self._jaccard_similarity(sig_a["task_tokens"], sig_b["task_tokens"])
+        role_sim = self._jaccard_similarity(sig_a["role_tokens"], sig_b["role_tokens"])
+        desc_sim = self._jaccard_similarity(sig_a["desc_tokens"], sig_b["desc_tokens"])
+        narrative_sim = self._jaccard_similarity(sig_a["narrative_ngrams"], sig_b["narrative_ngrams"])
+        name_sim = 1.0 if sig_a["name_norm"] and sig_a["name_norm"] == sig_b["name_norm"] else 0.0
+        bp_overlap = bool(sig_a["bp_keys"] & sig_b["bp_keys"])
+        bp_disjoint = bool(sig_a["bp_keys"]) and bool(sig_b["bp_keys"]) and not bp_overlap
+
+        # 이름보다 실제 내용(태스크/역할/서술/식별키) 중심 가중치
+        weighted = (
+            (task_sim * 0.42)
+            + (role_sim * 0.16)
+            + (desc_sim * 0.12)
+            + (narrative_sim * 0.24)
+            + (name_sim * 0.03)
+        )
+
+        # Strong content evidence: task overlap is high
+        if task_sim >= 0.62 and (sig_a["task_count"] > 0 and sig_b["task_count"] > 0):
+            weighted = max(weighted, 0.9)
+
+        # Shared business key inside content strongly indicates same business process.
+        if bp_overlap:
+            weighted = max(weighted, 0.94)
+
+        # If explicit business keys conflict, lower score to avoid false merge.
+        if bp_disjoint:
+            weighted *= 0.75
+
+        # Sparse task overlap but similar narrative + role can still be same process (e.g., part1/part2 split docs).
+        if task_sim < 0.2 and narrative_sim >= 0.45 and role_sim >= 0.2:
+            weighted = max(weighted, 0.72)
+
+        return {
+            "score": weighted,
+            "task_sim": task_sim,
+            "role_sim": role_sim,
+            "desc_sim": desc_sim,
+            "narrative_sim": narrative_sim,
+            "name_sim": name_sim,
+            "bp_overlap": bp_overlap,
+            "bp_disjoint": bp_disjoint,
+        }
+
+    def _merge_duplicate_processes(
+        self,
+        processes: list,
+        tasks: list,
+        roles: list,
+        chunks: list = None,
+    ) -> tuple[list, dict]:
+        """
+        내용 기반(태스크/역할/설명) 유사도로 중복 프로세스를 병합하고,
+        병합된 프로세스 ID 매핑을 반환.
+
         Returns:
             tuple: (병합된 프로세스 목록, {기존 process_id -> 병합된 process_id} 매핑)
         """
         if not processes:
             return [], {}
-        
-        # 이름별로 프로세스 그룹화
-        name_to_processes = {}
+
+        # 역할 ID -> 이름 매핑
+        role_id_to_name = {}
+        for role in roles or []:
+            rid = getattr(role, "role_id", "")
+            if rid:
+                role_id_to_name[rid] = getattr(role, "name", "") or ""
+
+        # 청크 인덱스: process/task 엔티티가 어떤 원문 청크에서 나왔는지 연결
+        chunk_text_by_id = {}
+        chunk_doc_by_id = {}
+        doc_text_fragments = {}
+        for ch in chunks or []:
+            cid = getattr(ch, "chunk_id", "")
+            if cid:
+                chunk_text_by_id[cid] = getattr(ch, "text", "") or ""
+                chunk_doc_by_id[cid] = getattr(ch, "doc_id", "") or ""
+                did = getattr(ch, "doc_id", "") or ""
+                if did:
+                    doc_text_fragments.setdefault(did, [])
+                    txt = (getattr(ch, "text", "") or "").strip()
+                    if txt:
+                        # Keep bounded memory; enough for process key/context capture.
+                        doc_text_fragments[did].append(txt[:1200])
+
+        def _collect_process_evidence_text(proc_id: str) -> str:
+            """
+            Gather request-wide evidence text for a process from:
+            - direct process chunk
+            - task chunks belonging to that process
+            - related document-level snippets
+            """
+            evidence_chunks = []
+            related_doc_ids = set()
+
+            proc_chunk_id = self.entity_chunk_map.get(proc_id, "")
+            if proc_chunk_id:
+                txt = chunk_text_by_id.get(proc_chunk_id, "")
+                if txt:
+                    evidence_chunks.append(txt[:2000])
+                did = chunk_doc_by_id.get(proc_chunk_id, "")
+                if did:
+                    related_doc_ids.add(did)
+
+            for t in tasks:
+                if getattr(t, "process_id", "") != proc_id:
+                    continue
+                task_id = getattr(t, "task_id", "")
+                if not task_id:
+                    continue
+                task_chunk_id = self.entity_chunk_map.get(task_id, "")
+                if not task_chunk_id:
+                    continue
+                txt = chunk_text_by_id.get(task_chunk_id, "")
+                if txt:
+                    evidence_chunks.append(txt[:1800])
+                did = chunk_doc_by_id.get(task_chunk_id, "")
+                if did:
+                    related_doc_ids.add(did)
+
+            # Add doc-level context to recover business keys often only stated once in the file.
+            doc_contexts = []
+            for did in related_doc_ids:
+                parts = doc_text_fragments.get(did, [])
+                if not parts:
+                    continue
+                doc_contexts.append(" ".join(parts[:10])[:5000])
+
+            merged = " ".join(evidence_chunks + doc_contexts).strip()
+            return merged[:12000]
+
+        # 프로세스별 시그니처 준비
+        signatures = {
+            proc.proc_id: self._build_process_signature(
+                proc,
+                tasks,
+                role_id_to_name,
+                source_text=_collect_process_evidence_text(proc.proc_id),
+            )
+            for proc in processes
+        }
+
+        # Union-Find for clustering
+        parent = {proc.proc_id: proc.proc_id for proc in processes}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # Pairwise similarity-based merging
+        for i in range(len(processes)):
+            for j in range(i + 1, len(processes)):
+                a = processes[i]
+                b = processes[j]
+                sig_a = signatures.get(a.proc_id, {})
+                sig_b = signatures.get(b.proc_id, {})
+                sim_detail = self._process_similarity(sig_a, sig_b)
+                sim = float(sim_detail.get("score", 0.0))
+
+                # Merge only when content evidence exists
+                has_content_signal = bool(
+                    sig_a.get("task_tokens")
+                    or sig_b.get("task_tokens")
+                    or sig_a.get("role_tokens")
+                    or sig_b.get("role_tokens")
+                    or sig_a.get("narrative_ngrams")
+                    or sig_b.get("narrative_ngrams")
+                )
+
+                threshold = 0.68
+                if sim_detail.get("bp_overlap"):
+                    threshold = 0.55
+                elif sim_detail.get("task_sim", 0.0) < 0.2 and sim_detail.get("narrative_sim", 0.0) >= 0.45:
+                    threshold = 0.64
+
+                if has_content_signal and sim >= threshold:
+                    union(a.proc_id, b.proc_id)
+                    print(
+                        f"   🔗 내용 기반 프로세스 병합 후보 채택: "
+                        f"'{a.name}' ↔ '{b.name}' "
+                        f"(score={sim:.2f}, task={sim_detail.get('task_sim', 0.0):.2f}, "
+                        f"role={sim_detail.get('role_sim', 0.0):.2f}, "
+                        f"narr={sim_detail.get('narrative_sim', 0.0):.2f}, "
+                        f"bp_overlap={sim_detail.get('bp_overlap')})"
+                    )
+                else:
+                    # 디버깅: 왜 병합이 안 되었는지 점수 근거를 항상 남긴다.
+                    print(
+                        f"   🧪 프로세스 유사도 평가: "
+                        f"'{a.name}' ↔ '{b.name}' "
+                        f"(score={sim:.2f}, threshold={threshold:.2f}, "
+                        f"task={sim_detail.get('task_sim', 0.0):.2f}, "
+                        f"role={sim_detail.get('role_sim', 0.0):.2f}, "
+                        f"desc={sim_detail.get('desc_sim', 0.0):.2f}, "
+                        f"narr={sim_detail.get('narrative_sim', 0.0):.2f}, "
+                        f"bp_overlap={sim_detail.get('bp_overlap')}, "
+                        f"bp_disjoint={sim_detail.get('bp_disjoint')})"
+                    )
+
+        # Build clusters
+        clusters = {}
         for proc in processes:
-            name_key = proc.name.lower().strip()
-            if name_key not in name_to_processes:
-                name_to_processes[name_key] = []
-            name_to_processes[name_key].append(proc)
-        
+            root = find(proc.proc_id)
+            clusters.setdefault(root, []).append(proc)
+
         unique_processes = []
-        process_id_mapping = {}  # old_id -> new_id
-        
-        for name_key, proc_group in name_to_processes.items():
-            # 첫 번째 프로세스를 primary로 선택
-            primary = proc_group[0]
+        process_id_mapping = {}
+
+        for _, proc_group in clusters.items():
+            # 대표 프로세스 선택: 태스크 수 많은 순 > 설명 긴 순
+            def _rank(p):
+                sig = signatures.get(p.proc_id, {})
+                desc_len = len((getattr(p, "description", "") or "") + (getattr(p, "purpose", "") or ""))
+                return (sig.get("task_count", 0), desc_len)
+
+            primary = max(proc_group, key=_rank)
             unique_processes.append(primary)
-            
-            # 나머지 프로세스의 정보를 primary에 병합
-            for other in proc_group[1:]:
-                # ID 매핑 저장 (다른 프로세스 ID -> primary ID)
+
+            for other in proc_group:
                 process_id_mapping[other.proc_id] = primary.proc_id
-                
-                # 설명 병합 (빈 경우에만)
-                if other.description and not primary.description:
+                if other.proc_id == primary.proc_id:
+                    continue
+                # 텍스트 정보는 비어있는 필드만 보강
+                if getattr(other, "description", "") and not getattr(primary, "description", ""):
                     primary.description = other.description
-                if other.purpose and not primary.purpose:
+                if getattr(other, "purpose", "") and not getattr(primary, "purpose", ""):
                     primary.purpose = other.purpose
-                
                 print(f"   🔗 프로세스 병합: '{other.name}' ({other.proc_id[:8]}...) → ({primary.proc_id[:8]}...)")
-            
-            # primary도 자기 자신으로 매핑 (일관성)
-            process_id_mapping[primary.proc_id] = primary.proc_id
-        
+
         return unique_processes, process_id_mapping
     
     def _update_task_process_ids(self, tasks: list, process_id_mapping: dict) -> list:

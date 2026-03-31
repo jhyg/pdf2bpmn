@@ -1,6 +1,9 @@
 """Neo4j database client and schema management."""
+import json
 from typing import Any, Optional
 from contextlib import contextmanager
+from uuid import uuid4
+from datetime import datetime
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
@@ -1290,6 +1293,344 @@ class Neo4jClient:
         node_count = len([x for x in elements if isinstance(x, dict) and x.get("data", {}).get("source") is None])
         edge_count = len(elements) - node_count
         return {"process_id": proc_id, "elements": elements, "counts": {"nodes": node_count, "edges": edge_count}}
+
+    def get_full_graph_elements(self, max_nodes: int = 3000) -> dict:
+        """
+        Return process-core whole graph as Cytoscape-compatible elements.
+        Includes all nodes/edges among PROCESS_CORE_LABELS.
+        """
+        target_labels = self.PROCESS_CORE_LABELS
+        max_nodes = max(100, min(int(max_nodes or 3000), 10000))
+
+        # 1) Collect nodes (bounded)
+        with self.session() as session:
+            node_rows = session.run(
+                """
+                MATCH (n)
+                WHERE any(label IN labels(n) WHERE label IN $labels)
+                RETURN elementId(n) as eid, labels(n) as labels, properties(n) as props
+                LIMIT $max_nodes
+                """,
+                {"labels": target_labels, "max_nodes": max_nodes},
+            )
+
+            nodes = []
+            for row in node_rows:
+                eid = str(row.get("eid") or "")
+                labels = row.get("labels") or []
+                props = row.get("props") or {}
+                if not eid or not labels:
+                    continue
+                nodes.append({"eid": eid, "labels": labels, "props": props})
+
+            if not nodes:
+                return {"elements": [], "counts": {"nodes": 0, "edges": 0}}
+
+            # Build node id mapping
+            id_field_map = {
+                "Process": "proc_id",
+                "Task": "task_id",
+                "Role": "role_id",
+                "Agent": "agent_id",
+                "Gateway": "gateway_id",
+                "Event": "event_id",
+                "Skill": "skill_id",
+                "DMNDecision": "decision_id",
+                "DMNRule": "rule_id",
+            }
+
+            elements: list[dict] = []
+            eid_to_node_id: dict[str, str] = {}
+
+            for n in nodes:
+                labels = n["labels"]
+                props = n["props"]
+                eid = n["eid"]
+                primary = ""
+                for cand in target_labels:
+                    if cand in labels:
+                        primary = cand
+                        break
+                if not primary:
+                    primary = labels[0]
+
+                id_field = id_field_map.get(primary, "")
+                business_id = str(props.get(id_field) or "").strip() if id_field else ""
+                node_id = f"{primary}:{business_id or eid}"
+                eid_to_node_id[eid] = node_id
+
+                label = (
+                    str(props.get("name") or "")
+                    or str(props.get(id_field) or "")
+                    or primary
+                )
+                node_data = {"id": node_id, "type": primary, "label": label, **props}
+                elements.append({"data": node_data})
+
+            # 2) Collect relationships among selected nodes
+            rel_rows = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE elementId(a) IN $node_eids AND elementId(b) IN $node_eids
+                RETURN elementId(a) as a_eid, elementId(b) as b_eid, type(r) as rel_type, properties(r) as rel_props
+                """,
+                {"node_eids": list(eid_to_node_id.keys())},
+            )
+
+            edge_count = 0
+            for row in rel_rows:
+                a_eid = str(row.get("a_eid") or "")
+                b_eid = str(row.get("b_eid") or "")
+                rel_type = str(row.get("rel_type") or "")
+                rel_props = row.get("rel_props") or {}
+                src = eid_to_node_id.get(a_eid)
+                dst = eid_to_node_id.get(b_eid)
+                if not src or not dst:
+                    continue
+                edge_id = f"{rel_type}:{src}->{dst}"
+                edge_data = {"id": edge_id, "source": src, "target": dst, "type": rel_type, "label": rel_type, **rel_props}
+                elements.append({"data": edge_data})
+                edge_count += 1
+
+        return {"elements": elements, "counts": {"nodes": len(nodes), "edges": edge_count}}
+
+    # ==================== Request Graph Snapshot ====================
+
+    def save_request_graph_snapshots(
+        self,
+        run_id: str,
+        integrated_graph: dict,
+        process_graphs: dict[str, dict],
+        metadata: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """
+        Persist request-level integrated graph + per-process graph snapshots.
+        Snapshots are stored separately from process-core labels so they survive core graph cleanup.
+        """
+        if not run_id:
+            return {"saved": False, "reason": "empty_run_id"}
+
+        now = datetime.utcnow().isoformat()
+        meta = metadata or {}
+        task_id = str(meta.get("task_id") or "").strip()
+        integrated_payload = json.dumps(integrated_graph or {}, ensure_ascii=False)
+
+        with self.session() as session:
+            # Upsert run envelope
+            session.run(
+                """
+                MERGE (r:GraphRun {run_id: $run_id})
+                SET r.updated_at = datetime($now),
+                    r.created_at = coalesce(r.created_at, datetime($now)),
+                    r.task_id = $task_id,
+                    r.metadata = $metadata
+                """,
+                {
+                    "run_id": run_id,
+                    "now": now,
+                    "task_id": task_id,
+                    "metadata": json.dumps(meta, ensure_ascii=False),
+                },
+            )
+
+            # Replace integrated snapshot (latest-only per run)
+            session.run(
+                """
+                MATCH (r:GraphRun {run_id: $run_id})
+                OPTIONAL MATCH (r)-[:HAS_SNAPSHOT]->(old:GraphSnapshot {snapshot_type: 'integrated'})
+                DETACH DELETE old
+                CREATE (s:GraphSnapshot {
+                    snapshot_id: $snapshot_id,
+                    run_id: $run_id,
+                    snapshot_type: 'integrated',
+                    proc_id: '',
+                    payload_json: $payload_json,
+                    created_at: datetime($now)
+                })
+                MERGE (r)-[:HAS_SNAPSHOT]->(s)
+                """,
+                {
+                    "snapshot_id": str(uuid4()),
+                    "run_id": run_id,
+                    "payload_json": integrated_payload,
+                    "now": now,
+                },
+            )
+
+            # Replace process snapshots for this run
+            for proc_id, graph in (process_graphs or {}).items():
+                payload = json.dumps(graph or {}, ensure_ascii=False)
+                session.run(
+                    """
+                    MATCH (r:GraphRun {run_id: $run_id})
+                    OPTIONAL MATCH (r)-[:HAS_SNAPSHOT]->(old:GraphSnapshot {snapshot_type: 'process', proc_id: $proc_id})
+                    DETACH DELETE old
+                    CREATE (s:GraphSnapshot {
+                        snapshot_id: $snapshot_id,
+                        run_id: $run_id,
+                        snapshot_type: 'process',
+                        proc_id: $proc_id,
+                        payload_json: $payload_json,
+                        created_at: datetime($now)
+                    })
+                    MERGE (r)-[:HAS_SNAPSHOT]->(s)
+                    """,
+                    {
+                        "snapshot_id": str(uuid4()),
+                        "run_id": run_id,
+                        "proc_id": str(proc_id or ""),
+                        "payload_json": payload,
+                        "now": now,
+                    },
+                )
+
+        return {
+            "saved": True,
+            "run_id": run_id,
+            "process_snapshot_count": len(process_graphs or {}),
+        }
+
+    def get_request_integrated_graph(self, run_id: str) -> Optional[dict]:
+        """Fetch integrated graph snapshot for a run."""
+        with self.session() as session:
+            rec = session.run(
+                """
+                MATCH (:GraphRun {run_id: $run_id})-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'integrated'})
+                RETURN s.payload_json as payload_json
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                {"run_id": run_id},
+            ).single()
+            if not rec:
+                return None
+            try:
+                return json.loads(rec["payload_json"] or "{}")
+            except Exception:
+                return None
+
+    def get_latest_request_integrated_graph(self) -> Optional[dict]:
+        """Fetch latest integrated graph snapshot across all runs."""
+        with self.session() as session:
+            rec = session.run(
+                """
+                MATCH (r:GraphRun)-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'integrated'})
+                RETURN r.run_id as run_id, r.task_id as task_id, s.payload_json as payload_json, s.created_at as created_at
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """
+            ).single()
+            if not rec:
+                return None
+            try:
+                payload = json.loads(rec["payload_json"] or "{}")
+                if isinstance(payload, dict):
+                    payload.setdefault("run_id", rec.get("run_id"))
+                    payload.setdefault("task_id", rec.get("task_id"))
+                return payload
+            except Exception:
+                return None
+
+    def get_request_process_graph(self, run_id: str, proc_id: str) -> Optional[dict]:
+        """Fetch process graph snapshot for a run/proc pair."""
+        with self.session() as session:
+            rec = session.run(
+                """
+                MATCH (:GraphRun {run_id: $run_id})-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'process', proc_id: $proc_id})
+                RETURN s.payload_json as payload_json
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                {"run_id": run_id, "proc_id": proc_id},
+            ).single()
+            if not rec:
+                return None
+            try:
+                return json.loads(rec["payload_json"] or "{}")
+            except Exception:
+                return None
+
+    def get_latest_integrated_graph_by_proc_id(self, proc_id: str) -> Optional[dict]:
+        """
+        Fetch latest integrated graph snapshot by proc_id.
+        This follows:
+          process snapshot(proc_id) -> GraphRun -> integrated snapshot
+        """
+        if not proc_id:
+            return None
+        with self.session() as session:
+            rec = session.run(
+                """
+                MATCH (r:GraphRun)-[:HAS_SNAPSHOT]->(ps:GraphSnapshot {snapshot_type: 'process', proc_id: $proc_id})
+                MATCH (r)-[:HAS_SNAPSHOT]->(isn:GraphSnapshot {snapshot_type: 'integrated'})
+                RETURN r.run_id as run_id, isn.payload_json as payload_json, isn.created_at as created_at
+                ORDER BY isn.created_at DESC
+                LIMIT 1
+                """,
+                {"proc_id": proc_id},
+            ).single()
+            if not rec:
+                return None
+            try:
+                payload = json.loads(rec["payload_json"] or "{}")
+                if isinstance(payload, dict):
+                    payload.setdefault("run_id", rec.get("run_id"))
+                    payload.setdefault("source_proc_id", proc_id)
+                return payload
+            except Exception:
+                return None
+
+    def get_latest_request_integrated_graph_by_task(self, task_id: str) -> Optional[dict]:
+        """Fetch latest integrated graph snapshot by request task_id."""
+        if not task_id:
+            return None
+        with self.session() as session:
+            # 1) exact task_id property match
+            rec = session.run(
+                """
+                MATCH (r:GraphRun {task_id: $task_id})-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'integrated'})
+                RETURN r.run_id as run_id, r.task_id as matched_task_id, s.payload_json as payload_json, s.created_at as created_at
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                {"task_id": task_id},
+            ).single()
+
+            # 2) legacy fallback: run_id prefix (run_id is usually "{task_id}-{suffix}")
+            if not rec:
+                rec = session.run(
+                    """
+                    MATCH (r:GraphRun)-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'integrated'})
+                    WHERE r.run_id STARTS WITH ($task_id + '-')
+                    RETURN r.run_id as run_id, r.task_id as matched_task_id, s.payload_json as payload_json, s.created_at as created_at
+                    ORDER BY s.created_at DESC
+                    LIMIT 1
+                    """,
+                    {"task_id": task_id},
+                ).single()
+
+            # 3) metadata fallback for old rows where task_id wasn't promoted as property
+            if not rec:
+                rec = session.run(
+                    """
+                    MATCH (r:GraphRun)-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'integrated'})
+                    WHERE coalesce(r.metadata, '') CONTAINS $task_id
+                    RETURN r.run_id as run_id, r.task_id as matched_task_id, s.payload_json as payload_json, s.created_at as created_at
+                    ORDER BY s.created_at DESC
+                    LIMIT 1
+                    """,
+                    {"task_id": task_id},
+                ).single()
+            if not rec:
+                return None
+            try:
+                payload = json.loads(rec["payload_json"] or "{}")
+                if isinstance(payload, dict):
+                    payload.setdefault("run_id", rec.get("run_id"))
+                    payload.setdefault("task_id", rec.get("matched_task_id") or task_id)
+                return payload
+            except Exception:
+                return None
     
     def search_similar_by_name(
         self, 

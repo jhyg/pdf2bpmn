@@ -5397,6 +5397,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 except Exception:
                     continue
 
+            # 요청 단위 그래프 스냅샷 식별자
+            request_graph_run_id = f"{task_id}-{uuid.uuid4().hex[:8]}"
             extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
             if not job_process_ids:
                 await self._send_progress_event(
@@ -5421,8 +5423,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             flows = await asyncio.to_thread(neo4j.get_sequence_flows, proc_id)
                             if isinstance(flows, list):
                                 detail["sequence_flows"] = flows
+                            graph_elements = await asyncio.to_thread(neo4j.get_process_graph_elements, proc_id)
                             extracted_by_proc_id[proc_id] = {
                                 "detail": detail,
+                                "graph_elements": graph_elements or {},
                                 "process_name": (detail.get("process", {}) or {}).get("name")
                                 or process_names_by_id.get(proc_id)
                                 or "",
@@ -5437,6 +5441,187 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
             extracted_count2 = len(extracted_by_proc_id)
             logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {extracted_count2}개")
+
+            # -----------------------------------------------------------------
+            # 동일/유사 이름 프로세스가 중복 추출된 경우, 저장 직전에 보수적으로 병합
+            # - 여러 파일이 하나의 프로세스를 나눠 설명하는 케이스에서 중복 저장 방지
+            # -----------------------------------------------------------------
+            def _norm_proc_name(name: Any) -> str:
+                text = str(name or "").strip().lower()
+                text = re.sub(r"\s+", " ", text)
+                return text
+
+            def _dedup_list(items: Any, key_builder):
+                if not isinstance(items, list):
+                    return []
+                seen: Set[str] = set()
+                out: List[Any] = []
+                for item in items:
+                    try:
+                        key = key_builder(item)
+                    except Exception:
+                        key = ""
+                    key = str(key or "").strip()
+                    if not key:
+                        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(item)
+                return out
+
+            def _merge_graph_elements(g1: Any, g2: Any) -> Dict[str, Any]:
+                base = g1 if isinstance(g1, dict) else {}
+                inc = g2 if isinstance(g2, dict) else {}
+                e1 = base.get("elements") if isinstance(base.get("elements"), list) else []
+                e2 = inc.get("elements") if isinstance(inc.get("elements"), list) else []
+                merged: List[Dict[str, Any]] = []
+                seen_ids: Set[str] = set()
+                for el in (e1 + e2):
+                    if not isinstance(el, dict):
+                        continue
+                    data = el.get("data") or {}
+                    eid = str(data.get("id") or "").strip()
+                    if not eid:
+                        continue
+                    if eid in seen_ids:
+                        continue
+                    seen_ids.add(eid)
+                    merged.append(el)
+                counts = dict(base.get("counts") or {})
+                counts["elements"] = len(merged)
+                return {
+                    **base,
+                    "elements": merged,
+                    "counts": counts,
+                }
+
+            merged_by_name: Dict[str, Dict[str, Any]] = {}
+            for proc_id, pinfo in extracted_by_proc_id.items():
+                process_name = (pinfo.get("process_name") or "").strip()
+                norm_name = _norm_proc_name(process_name)
+                detail = pinfo.get("detail") or {}
+                graph_elements = pinfo.get("graph_elements") or {}
+
+                # 이름이 비어있으면 병합하지 않고 독립 유지
+                merge_key = norm_name if norm_name else f"__{proc_id}"
+                if merge_key not in merged_by_name:
+                    pinfo_copy = dict(pinfo)
+                    pinfo_copy["detail"] = dict(detail) if isinstance(detail, dict) else {}
+                    pinfo_copy["graph_elements"] = dict(graph_elements) if isinstance(graph_elements, dict) else {}
+                    pinfo_copy["_source_proc_ids"] = [proc_id]
+                    merged_by_name[merge_key] = pinfo_copy
+                    continue
+
+                target = merged_by_name[merge_key]
+                target_detail = target.get("detail") or {}
+                target_detail = target_detail if isinstance(target_detail, dict) else {}
+                incoming_detail = detail if isinstance(detail, dict) else {}
+
+                # process 본문은 설명이 더 긴 쪽을 우선
+                t_proc = target_detail.get("process") if isinstance(target_detail.get("process"), dict) else {}
+                i_proc = incoming_detail.get("process") if isinstance(incoming_detail.get("process"), dict) else {}
+                t_desc = str(t_proc.get("description") or "")
+                i_desc = str(i_proc.get("description") or "")
+                if len(i_desc) > len(t_desc):
+                    target_detail["process"] = i_proc
+                    if i_proc.get("name"):
+                        target["process_name"] = str(i_proc.get("name"))
+
+                target_detail["tasks"] = _dedup_list(
+                    (target_detail.get("tasks") or []) + (incoming_detail.get("tasks") or []),
+                    lambda x: (x or {}).get("task_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                )
+                target_detail["roles"] = _dedup_list(
+                    (target_detail.get("roles") or []) + (incoming_detail.get("roles") or []),
+                    lambda x: (x or {}).get("role_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                )
+                target_detail["gateways"] = _dedup_list(
+                    (target_detail.get("gateways") or []) + (incoming_detail.get("gateways") or []),
+                    lambda x: (x or {}).get("gateway_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                )
+                target_detail["events"] = _dedup_list(
+                    (target_detail.get("events") or []) + (incoming_detail.get("events") or []),
+                    lambda x: (x or {}).get("event_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                )
+                target_detail["sequence_flows"] = _dedup_list(
+                    (target_detail.get("sequence_flows") or target_detail.get("flows") or [])
+                    + (incoming_detail.get("sequence_flows") or incoming_detail.get("flows") or []),
+                    lambda x: f"{(x or {}).get('source')}>{(x or {}).get('target')}|{(x or {}).get('condition') or ''}",
+                )
+                target["detail"] = target_detail
+                target["graph_elements"] = _merge_graph_elements(target.get("graph_elements"), graph_elements)
+                src = target.get("_source_proc_ids") if isinstance(target.get("_source_proc_ids"), list) else []
+                src.append(proc_id)
+                target["_source_proc_ids"] = src
+
+            if len(merged_by_name) != len(extracted_by_proc_id):
+                logger.info(
+                    f"[MERGE] duplicate-name merge applied: {len(extracted_by_proc_id)} -> {len(merged_by_name)}"
+                )
+            extracted_by_proc_id = {
+                (v.get("_source_proc_ids")[0] if isinstance(v.get("_source_proc_ids"), list) and v.get("_source_proc_ids") else k): v
+                for k, v in merged_by_name.items()
+            }
+
+            # -----------------------------------------------------------------
+            # 요청 단위 통합 그래프 + 최종 프로세스 그래프 스냅샷 저장
+            # -----------------------------------------------------------------
+            try:
+                process_graphs: Dict[str, Dict[str, Any]] = {}
+                integrated_elements: List[Dict[str, Any]] = []
+                seen_element_ids: Set[str] = set()
+                for pid, pinfo in extracted_by_proc_id.items():
+                    g = pinfo.get("graph_elements") or {}
+                    if isinstance(g, dict):
+                        process_graphs[pid] = g
+                        for el in g.get("elements") or []:
+                            if not isinstance(el, dict):
+                                continue
+                            data = el.get("data") or {}
+                            eid = str(data.get("id") or "").strip()
+                            if not eid or eid in seen_element_ids:
+                                continue
+                            seen_element_ids.add(eid)
+                            integrated_elements.append(el)
+
+                integrated_graph = {
+                    "run_id": request_graph_run_id,
+                    "task_id": str(task_id or ""),
+                    "process_ids": list(extracted_by_proc_id.keys()),
+                    "elements": integrated_elements,
+                    "counts": {
+                        "elements": len(integrated_elements),
+                        "processes": len(process_graphs),
+                    },
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
+
+                def _save_graph_snapshots_sync():
+                    client = Neo4jClient()
+                    try:
+                        return client.save_request_graph_snapshots(
+                            run_id=request_graph_run_id,
+                            integrated_graph=integrated_graph,
+                            process_graphs=process_graphs,
+                            metadata={
+                                "task_id": str(task_id or ""),
+                                "tenant_id": str(tenant_id or ""),
+                                "process_count": len(process_graphs),
+                            },
+                        )
+                    finally:
+                        client.close()
+
+                graph_snapshot_result = await asyncio.to_thread(_save_graph_snapshots_sync)
+                logger.info(
+                    "[GRAPH] request graph snapshots saved: "
+                    f"run_id={request_graph_run_id}, result={graph_snapshot_result}"
+                )
+            except Exception as e:
+                logger.warning(f"[WARN] request graph snapshot save failed: {e}")
             
             # 9. 각 추출 프로세스에 대해 ProcessGPT 정의/유저매핑 → XML 생성 → DB 저장
             saved_processes = []
@@ -5547,6 +5732,22 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         ex = {}
                     ex["source"] = "pdf2bpmn"
                     ex["neo4j_proc_id"] = str(proc_id)
+                    ex["graph_run_id"] = request_graph_run_id
+                    ex["graph_snapshot_ref"] = {
+                        "run_id": request_graph_run_id,
+                        "snapshot_type": "process",
+                        "proc_id": str(proc_id),
+                    }
+                    ex["integrated_graph_ref"] = {
+                        "run_id": request_graph_run_id,
+                        "snapshot_type": "integrated",
+                    }
+                    # 가벼운 임베드(디버깅/복구용): 실제 조회는 GraphSnapshot API 권장
+                    if isinstance(pinfo.get("graph_elements"), dict):
+                        ex["process_graph_preview"] = {
+                            "process_id": str(proc_id),
+                            "counts": (pinfo.get("graph_elements") or {}).get("counts") or {},
+                        }
                     proc_json["extraction"] = ex
                 except Exception:
                     pass
@@ -5806,6 +6007,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "message": completed_message,
                 "status": "completed",
                 "job_id": job_id,
+                "graph_run_id": request_graph_run_id,
                 "pdf_name": pdf_name,
                 "pdf_names": input_file_names,
                 "file_count": len(input_file_names),
@@ -5823,6 +6025,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             
             final_artifact_data = {
                 "type": "pdf2bpmn_result",
+                "graph_run_id": request_graph_run_id,
                 "pdf_name": pdf_name,
                 "pdf_names": input_file_names,
                 "file_count": len(input_file_names),

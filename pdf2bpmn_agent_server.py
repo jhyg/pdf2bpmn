@@ -182,6 +182,8 @@ class PDF2BPMNServerManager:
         Minimal embedded API:
         - /api/health
         - /api/processes/{proc_id}/graph  (Neo4j subgraph -> cytoscape elements)
+        - /api/graph/requests/{task_id}   (request-level integrated graph snapshot)
+        - /api/graph/full                 (latest integrated graph by default)
         """
         app = FastAPI(title="PDF2BPMN Embedded Graph API", version="0.1.0")
         app.add_middleware(
@@ -212,7 +214,12 @@ class PDF2BPMNServerManager:
             return {
                 "status": "ok",
                 "name": "PDF2BPMN Embedded Graph API",
-                "endpoints": ["/api/health", "/api/processes/{proc_id}/graph"],
+                "endpoints": [
+                    "/api/health",
+                    "/api/processes/{proc_id}/graph",
+                    "/api/graph/requests/{task_id}",
+                    "/api/graph/full",
+                ],
             }
 
         @app.get("/api/processes/{proc_id}/graph")
@@ -224,6 +231,51 @@ class PDF2BPMNServerManager:
                 data = neo4j.get_process_graph_elements(proc_id)
                 if not data:
                     raise HTTPException(404, "Process not found")
+                return data
+            finally:
+                try:
+                    neo4j.close()
+                except Exception:
+                    pass
+
+        @app.get("/api/graph/requests/{task_id}")
+        async def request_integrated_graph(task_id: str):
+            if Neo4jClient is None:
+                raise HTTPException(500, "Neo4jClient is not available in this runtime")
+            neo4j = Neo4jClient()
+            try:
+                data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
+                if not data:
+                    raise HTTPException(404, "Request integrated graph not found")
+                return data
+            finally:
+                try:
+                    neo4j.close()
+                except Exception:
+                    pass
+
+        @app.get("/api/graph/full")
+        async def full_graph(
+            run_id: str = "",
+            task_id: str = "",
+            source: str = "integrated",
+            max_nodes: int = 3000,
+        ):
+            if Neo4jClient is None:
+                raise HTTPException(500, "Neo4jClient is not available in this runtime")
+            neo4j = Neo4jClient()
+            try:
+                src = (source or "integrated").strip().lower()
+                if src == "global":
+                    return neo4j.get_full_graph_elements(max_nodes=max_nodes)
+                if run_id:
+                    data = neo4j.get_request_integrated_graph(run_id)
+                elif task_id:
+                    data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
+                else:
+                    data = neo4j.get_latest_request_integrated_graph()
+                if not data:
+                    raise HTTPException(404, "Integrated graph not found")
                 return data
             finally:
                 try:
