@@ -20,7 +20,7 @@ import traceback
 import xml.etree.ElementTree as ET
 import sys
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 import io
 import zipfile
 
@@ -4560,7 +4560,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if (not strict) and (not (a.get("role") or "").strip()) and primary_role:
                 a["role"] = primary_role
             a.setdefault("description", "")
-            a.setdefault("instruction", a.get("instruction") or a.get("description") or "")
+            a.setdefault("instruction", a.get("instruction") or "")
+            if isinstance(a.get("instruction"), str):
+                # escaped newline("\\n")이 한 줄 텍스트로 남지 않도록 실제 개행으로 복원
+                a["instruction"] = (
+                    a.get("instruction", "")
+                    .replace("\r\n", "\n")
+                    .replace("\\r\\n", "\n")
+                    .replace("\\n", "\n")
+                    .replace("\\r", "\n")
+                )
             a.setdefault("duration", a.get("duration") or 5)
 
             # tool(form) - 없으면 안정적으로 생성
@@ -5629,6 +5638,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             total_bpmn = len(extracted_by_proc_id)
             agent_user_ids_for_skill_sync: Set[str] = set()
             agent_skill_names_for_sync: Dict[str, Set[str]] = {}
+            assigned_agent_user_ids: Set[str] = set()
+            initial_agent_user_ids: Set[str] = {
+                str(a.get("id"))
+                for a in (self._agents or [])
+                if isinstance(a, dict) and str(a.get("id") or "").strip()
+            }
+            uploaded_skill_names: List[str] = []
 
             # 온톨로지에서 추출/생성된 스킬 메타(에이전트와 독립 생성)
             generated_skill_metas: List[Dict[str, Any]] = []
@@ -5893,6 +5909,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                 aid = str(a.get("agent") or "").strip()
                                 role_name = str(a.get("role") or "").strip()
                                 if aid:
+                                    assigned_agent_user_ids.add(aid)
                                     agent_user_ids_for_skill_sync.add(aid)
                                     if role_name:
                                         process_role_agent_pairs.append((role_name, aid))
@@ -5963,6 +5980,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         )
                         if ok:
                             uploaded.append(safe)
+                    uploaded_skill_names = list(uploaded)
 
                     # Supabase sync (best-effort)
                     uploaded_set = {self._normalize_skill_key(x) for x in uploaded if str(x or "").strip()}
@@ -6003,16 +6021,60 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 else f"[COMPLETED] PDF2BPMN 변환 완료: {actual_count}개의 프로세스가 생성되었습니다."
             )
 
+            # 최종 요약: 스킬/에이전트 결과도 프론트에서 바로 렌더링 가능한 형태로 제공
+            uploaded_skill_set = {str(x or "").strip() for x in (uploaded_skill_names or []) if str(x or "").strip()}
+            saved_skills_summary: List[Dict[str, Any]] = []
+            seen_skill = set()
+            for sm in generated_skill_metas:
+                if not isinstance(sm, dict):
+                    continue
+                name = str(sm.get("name") or "").strip()
+                safe_name = str(sm.get("safe_name") or self._normalize_skill_key(name) or "").strip()
+                if not name or not safe_name:
+                    continue
+                key = safe_name.lower()
+                if key in seen_skill:
+                    continue
+                seen_skill.add(key)
+                saved_skills_summary.append(
+                    {
+                        "name": name,
+                        "safe_name": safe_name,
+                        "url_path": f"/skills/{quote(name, safe='')}",
+                        "uploaded": safe_name in uploaded_skill_set,
+                    }
+                )
+
+            users_by_id_now = {
+                str(u.get("id")): u
+                for u in (self._users or [])
+                if isinstance(u, dict) and str(u.get("id") or "").strip()
+            }
+            saved_agents_summary: List[Dict[str, Any]] = []
+            for aid in sorted({str(x).strip() for x in assigned_agent_user_ids if str(x).strip()}):
+                row = users_by_id_now.get(aid, {})
+                saved_agents_summary.append(
+                    {
+                        "id": aid,
+                        "name": str(row.get("username") or row.get("name") or aid),
+                        "role": str(row.get("role") or ""),
+                        "created": aid not in initial_agent_user_ids,
+                    }
+                )
+
             final_result = {
                 "message": completed_message,
                 "status": "completed",
                 "job_id": job_id,
+                "task_id": str(task_id or ""),
                 "graph_run_id": request_graph_run_id,
                 "pdf_name": pdf_name,
                 "pdf_names": input_file_names,
                 "file_count": len(input_file_names),
                 "process_count": actual_count,
                 "saved_processes": saved_processes,  # bpmn_xml 포함
+                "saved_skills": saved_skills_summary,
+                "saved_agents": saved_agents_summary,
                 "generated_at": datetime.now(timezone.utc).isoformat()
             }
             
@@ -6025,12 +6087,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             
             final_artifact_data = {
                 "type": "pdf2bpmn_result",
+                "task_id": str(task_id or ""),
                 "graph_run_id": request_graph_run_id,
                 "pdf_name": pdf_name,
                 "pdf_names": input_file_names,
                 "file_count": len(input_file_names),
                 "process_count": actual_count,
                 "saved_processes": saved_processes_summary,  # 요약만
+                "saved_skills": saved_skills_summary,
+                "saved_agents": saved_agents_summary,
                 "bpmn_xmls": all_bpmn_xmls,  # 모든 XML 내용
                 "success": True,
                 "completed_at": datetime.now(timezone.utc).isoformat(),

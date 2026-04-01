@@ -1083,14 +1083,12 @@ class PDF2BPMNWorkflow:
                     getattr(t, "instruction", "") for t in all_related if getattr(t, "instruction", "")
                 ]
                 if instructions:
-                    def _score_instruction(x: str) -> tuple[int, int]:
-                        lines = [ln.strip() for ln in (x or "").splitlines() if ln.strip()]
-                        return (len(lines), len(x))
-
-                    best = max(instructions, key=_score_instruction)
+                    # 원문 보존 우선:
+                    # - 라인 수 제한/요약 없이 수집
+                    # - 중복 라인만 제거하여 정보 손실을 최소화
                     merged_lines: list[str] = []
                     seen = set()
-                    for src in [best, *instructions]:
+                    for src in instructions:
                         for ln in (src or "").splitlines():
                             s = ln.strip()
                             if not s:
@@ -1099,7 +1097,7 @@ class PDF2BPMNWorkflow:
                                 continue
                             seen.add(s)
                             merged_lines.append(s)
-                    representative.instruction = "\n".join(merged_lines[:20]).strip()
+                    representative.instruction = "\n".join(merged_lines).strip()
                 
                 # ID 매핑 기록
                 for t in all_related:

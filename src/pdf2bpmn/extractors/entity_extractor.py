@@ -71,9 +71,10 @@ For tasks, also identify:
 - performer_role: Name of the role that performs this task (IMPORTANT!)
 - parent_process: Name of the process this task belongs to (IMPORTANT!)
 - instruction: **How to perform this task** (태스크 수행 지침, Korean)
-  - Write as a short, actionable step-by-step guide (numbered or bullet list in a single string)
-  - Include inputs/outputs or checkpoints if the text provides them
-  - Keep it concise (3~10 steps). If not enough information, return "".
+  - Preserve document wording as much as possible. Do NOT summarize or paraphrase when explicit instructions are present.
+  - Keep line breaks/order from source text whenever possible.
+  - Include inputs/outputs/checkpoints exactly as stated in the document if provided.
+  - If the source does not provide explicit execution instructions, return "".
 - order: Sequential order within the process (1, 2, 3...)
 - next_task: Name of the task that follows this one (if identifiable)
 - previous_task: Name of the task that precedes this one (if identifiable)

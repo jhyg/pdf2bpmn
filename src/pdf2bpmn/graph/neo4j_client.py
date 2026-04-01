@@ -1163,6 +1163,36 @@ class Neo4jClient:
         _add_nodes("Agent", agents, "agent_id")
         _add_nodes("Skill", skills, "skill_id")
 
+        # Instruction nodes (Task와 분리된 별도 노드)
+        task_instruction_map: dict[str, str] = {}
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("task_id") or "").strip()
+            inst = str(t.get("instruction") or "").strip()
+            if not tid or not inst:
+                continue
+            task_instruction_map[tid] = inst
+            inst_id = f"{tid}:instruction"
+            nid = _node_id("Instruction", inst_id)
+            if nid in node_ids:
+                continue
+            node_ids.add(nid)
+            first_line = inst.splitlines()[0] if inst.splitlines() else inst
+            label = first_line[:120] + ("..." if len(first_line) > 120 else "")
+            elements.append(
+                {
+                    "data": {
+                        "id": nid,
+                        "type": "Instruction",
+                        "label": label or "Instruction",
+                        "instruction_id": inst_id,
+                        "task_id": tid,
+                        "instruction": inst,
+                    }
+                }
+            )
+
         # Edges: process containment
         def _edge(eid: str, source: str, target: str, rel_type: str, extra: dict = None):
             d = {"id": eid, "source": source, "target": target, "type": rel_type, "label": rel_type}
@@ -1207,6 +1237,17 @@ class Neo4jClient:
                             _node_id("Role", rid),
                             "PERFORMED_BY",
                         )
+
+            # Edges: Task -> Instruction
+            for task_id, inst in task_instruction_map.items():
+                if not inst:
+                    continue
+                _edge(
+                    f"HAS_INSTRUCTION:Task:{task_id}",
+                    _node_id("Task", task_id),
+                    _node_id("Instruction", f"{task_id}:instruction"),
+                    "HAS_INSTRUCTION",
+                )
 
             role_agent_rows = session.run(
                 """
