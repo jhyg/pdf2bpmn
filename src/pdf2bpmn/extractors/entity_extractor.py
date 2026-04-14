@@ -1,5 +1,8 @@
 """LLM-based entity extraction from text."""
 import json
+import os
+import re
+import time
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -46,13 +49,11 @@ Analyze the following text and extract:
 5. **Events**: Start/End triggers (요청 접수 시, 신청서 제출 후, 정기적으로, 완료 시)
 6. **Decisions**: Business rules or decision logic (if-then rules)
 7. **Rules**: Specific decision rules (조건-결과 pairs)
-8. **Skills**: Professional know-how/capabilities needed to perform work (전문지식, 노하우, 역량, 기준, 판단법, 점검 방법)
 
 IMPORTANT: Also extract RELATIONSHIPS between entities:
-9. **task_role_mappings**: Which role performs which task
-10. **task_process_mappings**: Which process contains which task
-11. **role_skill_mappings**: Which role should have which skill
-12. **sequence_flows**: The order/sequence between tasks WITH CONDITIONS (VERY IMPORTANT!)
+8. **task_role_mappings**: Which role performs which task
+9. **task_process_mappings**: Which process contains which task
+10. **sequence_flows**: The order/sequence between tasks WITH CONDITIONS (VERY IMPORTANT!)
     - Identify which task comes BEFORE and AFTER another
     - **CONDITIONS GO HERE, NOT IN GATEWAYS**: "승인인 경우", "거부인 경우", "예산 부족 시", "금액 100만원 이상" etc.
     - Look for conditional keywords: "~인 경우", "~면", "~시", "아니면", "그렇지 않으면"
@@ -82,6 +83,8 @@ For tasks, also identify:
 For gateways (IMPORTANT: Gateway is just a BRANCHING POINT, NOT the condition itself):
 - gateway_type: "exclusive" (XOR - only one path taken), "parallel" (AND - all paths), "inclusive" (OR)
 - name: Descriptive name for the decision point (e.g., "승인 여부 분기", "예산 확인 분기", "금액 기준 분기")
+  - If description contains "~인지 여부", gateway name MUST follow "<주제> 여부 판단"
+    Example: "예비타당성조사 대상 사업인지 여부..." -> "예비타당성조사 대상 사업 여부 판단"
   DO NOT put condition text here - just the name of the decision point
 - parent_process: Name of the process this gateway belongs to
 - incoming_task: Name of the task before this gateway
@@ -92,13 +95,18 @@ For decisions:
 - output_data: List of output data items
 - related_role: Role that makes this decision
 
-For skills:
-- name: Clear skill/capability name (e.g., "수질 이상 징후 판독", "약품 투입량 산정")
-- summary: Short summary of the know-how
-- purpose: Why this skill is needed
-- procedure: Optional step list as short strings (if text provides)
-- related_role: Role that mainly uses this skill (optional)
-- related_tasks: Task names that use this skill (optional list)
+For rules:
+- decision_name: Name of the decision this rule belongs to (IMPORTANT)
+- decision_id: Optional, only when clearly known
+- when: Condition expression
+- then: Result/action
+
+IMPORTANT POLICY CHANGE:
+- Do NOT extract "skills" as a separate entity.
+- If the text contains professional know-how/criteria/judgment logic, map it to:
+  1) task.instruction (execution guidance), and/or
+  2) decisions/rules (explicit decision criteria).
+- Therefore, return "skills": [] and "role_skill_mappings": [].
 
 For task_role_mappings:
 - task_name: Name of the task
@@ -107,10 +115,6 @@ For task_role_mappings:
 For task_process_mappings:
 - task_name: Name of the task
 - process_name: Name of the parent process
-
-For role_skill_mappings:
-- role_name: Name of the role
-- skill_name: Name of the skill
 
 **For sequence_flows (CRITICAL - CONDITIONS ARE EXTRACTED HERE!):**
 - from_task: Name of the source task (or gateway name like "승인 여부 분기")
@@ -124,6 +128,13 @@ For role_skill_mappings:
     - "금액 100만원 이상" (amount >= 1M)
     - "금액 100만원 미만" (amount < 1M)
   Leave empty ("") for default/unconditional flows
+- CONDITION QUALITY RULES (MANDATORY):
+  - NEVER output placeholder conditions like "조건1", "조건 1", "분기1", "case1"
+  - NEVER output graph edge names/labels like "HAS_TASK", "HAS_INSTRUCTION", "PERFORMED_BY"
+  - If a gateway has multiple outgoing paths, each condition must be semantically distinct
+  - If an exclusive gateway has exactly 2 outgoing flows, prefer true/false pair:
+    "<주제>인 경우" / "<주제>이 아닌 경우"
+  - Prefer source wording from document ("승인인 경우", "미승인 시", "요건 충족 시", "재검토 필요 시")
 - process_name: Name of the process this flow belongs to
 
 Example of correct extraction:
@@ -194,15 +205,73 @@ class EntityExtractor:
     """Extract business process entities using LLM."""
     
     def __init__(self):
+        try:
+            llm_retries = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+        except Exception:
+            llm_retries = 2
+        llm_retries = max(0, llm_retries)
+
         self.llm = ChatOpenAI(
             model=Config.OPENAI_MODEL,
             api_key=Config.OPENAI_API_KEY,
-            temperature=0
+            base_url=(Config.OPENAI_BASE_URL or None),
+            temperature=0,
+            # 원복: 응답이 늦어도 완료될 때까지 대기
+            timeout=None,
+            max_retries=llm_retries,
         )
         self.parser = JsonOutputParser(pydantic_object=ExtractedEntities)
         self.prompt = ChatPromptTemplate.from_template(EXTRACTION_PROMPT)
         self.chain = self.prompt | self.llm | self.parser
-    
+
+    def _is_placeholder_gateway_name(self, name: str) -> bool:
+        key = "".join(str(name or "").lower().split())
+        if not key:
+            return True
+        if key in {"분기", "gateway", "gw", "decision"}:
+            return True
+        if any(key.startswith(prefix) for prefix in ("분기", "gateway", "gw", "decision")) and any(ch.isdigit() for ch in key):
+            return True
+        return False
+
+    def _extract_gateway_subject(self, text: str) -> str:
+        s = " ".join(str(text or "").split()).strip()
+        if not s:
+            return ""
+        patterns = [
+            r"(.+?)(?:인지|인가)\s*여부",
+            r"(.+?)\s*여부",
+        ]
+        for p in patterns:
+            m = re.search(p, s)
+            if m:
+                subj = " ".join((m.group(1) or "").split()).strip(" .,-_")
+                if subj:
+                    return subj
+        for tok in ("분기", "판단", "확인", "검토", "결정", "여부"):
+            s = s.replace(tok, " ")
+        s = " ".join(s.split()).strip(" .,-_")
+        return s
+
+    def _derive_gateway_name(self, raw_name: str, description: str, idx: int) -> str:
+        rn = " ".join(str(raw_name or "").split()).strip()
+        desc = " ".join(str(description or "").split()).strip()
+        subj = self._extract_gateway_subject(desc)
+        if subj:
+            return f"{subj} 여부 판단"
+        if rn and not self._is_placeholder_gateway_name(rn):
+            return rn
+        subj2 = self._extract_gateway_subject(rn)
+        if subj2:
+            return f"{subj2} 여부 판단"
+        return f"의사결정 분기 {idx}"
+
+    def _derive_true_false_conditions(self, gateway_name: str, gateway_description: str) -> tuple[str, str]:
+        subj = self._extract_gateway_subject(gateway_description) or self._extract_gateway_subject(gateway_name)
+        if subj:
+            return (f"{subj}인 경우", f"{subj}이 아닌 경우")
+        return ("조건 충족인 경우", "조건 미충족인 경우")
+
     def _build_context(
         self, 
         existing_processes: list[str] = None, 
@@ -266,22 +335,87 @@ class EntityExtractor:
         Returns:
             ExtractedEntities: 추출된 엔티티들
         """
+        t0 = time.perf_counter()
         try:
             # 기존 컨텍스트 생성 (프로세스, 역할, 태스크 모두 포함)
+            t_ctx0 = time.perf_counter()
             existing_context = self._build_context(
                 existing_processes, 
                 existing_roles,
                 existing_tasks
             )
+            t_ctx_ms = int((time.perf_counter() - t_ctx0) * 1000)
+            print(
+                f"   ⏱️ [EXTRACT-TIMING] context_build={t_ctx_ms}ms "
+                f"text_len={len(text or '')} ctx_len={len(existing_context or '')}"
+            )
             
+            t_llm0 = time.perf_counter()
             result = self.chain.invoke({
                 "text": text,
-                "existing_context": existing_context
+                "existing_context": existing_context,
             })
-            return ExtractedEntities(**result)
+            t_llm_ms = int((time.perf_counter() - t_llm0) * 1000)
+
+            t_parse0 = time.perf_counter()
+            parsed = ExtractedEntities(**result)
+            t_parse_ms = int((time.perf_counter() - t_parse0) * 1000)
+            t_total_ms = int((time.perf_counter() - t0) * 1000)
+            print(
+                f"   ⏱️ [EXTRACT-TIMING] llm_invoke={t_llm_ms}ms parse={t_parse_ms}ms total={t_total_ms}ms "
+                f"(tasks={len(parsed.tasks)}, roles={len(parsed.roles)}, gateways={len(parsed.gateways)}, "
+                f"flows={len(parsed.sequence_flows)}, decisions={len(parsed.decisions)}, rules={len(parsed.rules)})"
+            )
+            return parsed
         except Exception as e:
-            print(f"Extraction error: {e}")
+            t_total_ms = int((time.perf_counter() - t0) * 1000)
+            print(f"Extraction error: {e} (elapsed={t_total_ms}ms)")
             return ExtractedEntities()
+
+    def _is_reusable_skill_candidate(self, skill_payload: dict) -> bool:
+        """Filter out task-local instructions; keep reusable professional skills."""
+        if not isinstance(skill_payload, dict):
+            return False
+
+        name = str(skill_payload.get("name", "") or "").strip().lower()
+        summary = str(skill_payload.get("summary", "") or "").strip().lower()
+        purpose = str(skill_payload.get("purpose", "") or "").strip().lower()
+        related_tasks = skill_payload.get("related_tasks", [])
+        if not isinstance(related_tasks, list):
+            related_tasks = []
+
+        if len(name) < 3:
+            return False
+
+        # Highly task-local verbs/checklist wording usually indicate instructions, not reusable skills.
+        task_local_markers = [
+            "접수", "제출", "등록", "전달", "통보", "요청", "확인 후", "버튼", "클릭", "입력",
+            "업로드", "다운로드", "시스템", "화면", "메뉴", "양식 작성", "문서 작성", "작성 및 제출",
+        ]
+
+        # Reusable expertise markers.
+        reusable_markers = [
+            "평가", "분석", "판독", "산정", "예측", "검증", "분류", "판단", "기준", "규정",
+            "정책", "리스크", "위험도", "모델", "전략", "방법론", "체계", "기법", "해석",
+        ]
+
+        text = " ".join([name, summary, purpose]).strip()
+        if not text:
+            return False
+
+        has_task_local = any(m in text for m in task_local_markers)
+        has_reusable = any(m in text for m in reusable_markers)
+
+        # If only one very specific task is referenced and no reusable signal, likely instruction-like.
+        if len(related_tasks) <= 1 and has_task_local and not has_reusable:
+            return False
+
+        # If task-local wording dominates with no reusable clue, reject.
+        if has_task_local and not has_reusable:
+            return False
+
+        # Accept if reusable clues exist, or if purpose/summary are generic knowledge statements.
+        return has_reusable or ("전문" in text or "노하우" in text or "역량" in text)
     
     def convert_to_entities(
         self, 
@@ -466,13 +600,21 @@ class EntityExtractor:
             process_id = process_name_to_id.get(parent_process_name, "")
             if not process_id and entities["processes"]:
                 process_id = entities["processes"][0].proc_id
+
+            gw_desc = str(g.get("description", "") or "")
+            gw_name = self._derive_gateway_name(
+                str(g.get("name", "") or ""),
+                gw_desc,
+                idx=(len(entities["gateways"]) + 1),
+            )
             
             gateway = Gateway(
                 gateway_id=gateway_id,
                 process_id=process_id,
+                name=gw_name,
                 gateway_type=gw_type,
                 condition=g.get("condition", ""),
-                description=g.get("description", "")
+                description=gw_desc
             )
             entities["gateways"].append(gateway)
             
@@ -509,16 +651,20 @@ class EntityExtractor:
                 entities["entity_chunk_map"][event_id] = chunk_id
         
         # Convert decisions and rules with role linkage
+        decision_name_to_id = {}
         for d in extracted.decisions:
             decision_id = generate_id()
+            dname = d.get("name", "Decision")
             decision = DMNDecision(
                 decision_id=decision_id,
-                name=d.get("name", "Decision"),
+                name=dname,
                 description=d.get("description", ""),
                 input_data=d.get("input_data", []),
                 output_data=d.get("output_data", [])
             )
             entities["decisions"].append(decision)
+            if dname:
+                decision_name_to_id[str(dname).lower().strip()] = decision_id
             
             # Link decision to role
             related_role = (d.get("related_role") or "").lower()
@@ -533,9 +679,17 @@ class EntityExtractor:
         
         for r in extracted.rules:
             rule_id = generate_id()
+            mapped_decision_id = str(r.get("decision_id") or "").strip()
+            if not mapped_decision_id:
+                decision_name = str(r.get("decision_name") or r.get("decision") or "").lower().strip()
+                if decision_name:
+                    mapped_decision_id = decision_name_to_id.get(decision_name, "")
+            if not mapped_decision_id and entities["decisions"]:
+                # deterministic fallback: attach to first decision when only rules exist without explicit mapping
+                mapped_decision_id = entities["decisions"][0].decision_id
             rule = DMNRule(
                 rule_id=rule_id,
-                decision_id=r.get("decision_id", ""),
+                decision_id=mapped_decision_id,
                 when=r.get("when", r.get("condition", "")),
                 then=r.get("then", r.get("result", "")),
                 confidence=r.get("confidence", 1.0)
@@ -545,9 +699,72 @@ class EntityExtractor:
             if chunk_id:
                 entities["entity_chunk_map"][rule_id] = chunk_id
 
-        # Convert skills with optional role linkage
-        skill_name_to_id = {}
+        # Policy change: skills are no longer first-class outputs.
+        # Fold skill-like know-how into task instruction and DMN rules deterministically.
+        decision_name_to_obj = {d.name.lower().strip(): d for d in entities["decisions"] if getattr(d, "name", None)}
         for s in extracted.skills:
+            if not isinstance(s, dict):
+                continue
+            summary = str(s.get("summary") or s.get("description") or "").strip()
+            purpose = str(s.get("purpose") or "").strip()
+            proc = s.get("procedure") if isinstance(s.get("procedure"), list) else []
+            proc_lines = [str(x).strip() for x in proc if str(x).strip()]
+            knowhow_text = "\n".join([x for x in [summary, purpose, *proc_lines] if x]).strip()
+            if not knowhow_text:
+                continue
+
+            related_tasks = s.get("related_tasks") if isinstance(s.get("related_tasks"), list) else []
+            if related_tasks:
+                for tname in related_tasks:
+                    tn = str(tname or "").lower().strip()
+                    if not tn:
+                        continue
+                    for task in entities["tasks"]:
+                        task_name = str(task.name or "").lower().strip()
+                        if task_name and (task_name == tn or tn in task_name or task_name in tn):
+                            current_inst = str(task.instruction or "").strip()
+                            if knowhow_text not in current_inst:
+                                task.instruction = (current_inst + "\n" + knowhow_text).strip() if current_inst else knowhow_text
+                            break
+
+            # Also materialize as DMN rule (criteria/judgment logic) when possible.
+            dname = str(s.get("decision_name") or s.get("decision") or "").strip()
+            related_role = str(s.get("related_role") or "").strip()
+            if not dname:
+                dname = f"{related_role} 판단 기준" if related_role else "업무 판단 기준"
+            dkey = dname.lower().strip()
+            decision = decision_name_to_obj.get(dkey)
+            if not decision:
+                decision = DMNDecision(
+                    decision_id=generate_id(),
+                    name=dname,
+                    description="문서 내 전문지식/판단기준에서 자동 보강",
+                    input_data=[],
+                    output_data=["판단 결과"],
+                )
+                entities["decisions"].append(decision)
+                decision_name_to_obj[dkey] = decision
+                # Link decision to role when resolvable
+                rr = related_role.lower().strip()
+                if rr and rr in role_name_to_id:
+                    rid = role_name_to_id[rr]
+                    entities["role_decision_map"].setdefault(rid, []).append(decision.decision_id)
+
+            entities["rules"].append(
+                DMNRule(
+                    rule_id=generate_id(),
+                    decision_id=decision.decision_id,
+                    when="업무 수행 시",
+                    then=knowhow_text,
+                    confidence=0.8,
+                )
+            )
+
+        # Convert skills with optional role linkage (disabled by policy)
+        skill_name_to_id = {}
+        for s in []:
+            if not self._is_reusable_skill_candidate(s):
+                continue
             skill_id = generate_id()
             name = s.get("name", "Skill")
             procedure = s.get("procedure", [])
@@ -580,8 +797,8 @@ class EntityExtractor:
             if chunk_id:
                 entities["entity_chunk_map"][skill_id] = chunk_id
 
-        # Explicit role-skill mappings
-        for mapping in extracted.role_skill_mappings:
+        # Explicit role-skill mappings (disabled by policy)
+        for mapping in []:
             role_name = (mapping.get("role_name") or "").lower().strip()
             skill_name = (mapping.get("skill_name") or "").lower().strip()
             if not role_name or not skill_name:
@@ -594,13 +811,24 @@ class EntityExtractor:
         # Build gateway name -> id mapping
         gateway_name_to_id = {}
         for gw in entities["gateways"]:
-            gateway_name_to_id[gw.name.lower()] = gw.gateway_id
+            gname = str(gw.name or "").lower().strip()
+            if gname:
+                gateway_name_to_id[gname] = gw.gateway_id
         
         # Process sequence flows from extracted data (Task->Task, Task->Gateway, Gateway->Task)
+        _BAD_CONDITION_KEYS = {
+            "조건1", "조건2", "조건3", "조건4", "조건5",
+            "분기1", "분기2", "분기3",
+            "case1", "case2", "case3",
+            "hastask", "hasinstruction", "performedby", "hasgateway", "hasevent",
+        }
         for flow in extracted.sequence_flows:
             from_name = (flow.get("from_task") or "").lower()
             to_name = (flow.get("to_task") or "").lower()
             condition = flow.get("condition", "") or ""
+            cond_norm = "".join(str(condition).lower().split())
+            if cond_norm in _BAD_CONDITION_KEYS:
+                condition = ""
             
             from_id = None
             from_type = None
@@ -652,6 +880,134 @@ class EntityExtractor:
                 if condition:
                     print(f"   📍 Sequence flow with condition: {from_name} → {to_name} [{condition}]")
         
+        # Heuristic gateway synthesis:
+        # If no gateways were extracted but a source task has multiple conditional outgoing flows,
+        # synthesize an ExclusiveGateway to preserve branching semantics deterministically.
+        if not entities["gateways"] and extracted.sequence_flows:
+            # Build helper maps
+            task_name_to_id = {t.name.lower().strip(): t.task_id for t in entities["tasks"] if t.name}
+            task_id_to_proc = {t.task_id: t.process_id for t in entities["tasks"]}
+            grouped = {}
+            for flow in extracted.sequence_flows:
+                from_name = str(flow.get("from_task") or "").lower().strip()
+                to_name = str(flow.get("to_task") or "").lower().strip()
+                cond = str(flow.get("condition") or "").strip()
+                if not from_name or not to_name:
+                    continue
+                if not cond:
+                    continue
+                grouped.setdefault(from_name, []).append((to_name, cond))
+
+            synthesized_pairs = set()
+            for from_name, items in grouped.items():
+                # Need at least 2 distinct targets for real branching
+                uniq_targets = []
+                for to_name, _ in items:
+                    if to_name not in uniq_targets:
+                        uniq_targets.append(to_name)
+                if len(uniq_targets) < 2:
+                    continue
+
+                src_task_id = task_name_to_id.get(from_name)
+                if not src_task_id:
+                    continue
+                proc_id = task_id_to_proc.get(src_task_id, "")
+                gw_id = generate_id()
+                gw_name = self._derive_gateway_name(
+                    raw_name=f"{from_name} 분기",
+                    description=f"{from_name}인지 여부를 판단한다.",
+                    idx=(len(entities["gateways"]) + 1),
+                )
+                gw = Gateway(
+                    gateway_id=gw_id,
+                    process_id=proc_id,
+                    name=gw_name,
+                    gateway_type=GatewayType.EXCLUSIVE,
+                    condition="",
+                    description="조건 분기(자동 보강)"
+                )
+                entities["gateways"].append(gw)
+                gateway_name_to_id[gw.name.lower()] = gw_id
+                if chunk_id:
+                    entities["entity_chunk_map"][gw_id] = chunk_id
+
+                # Replace direct src->target conditional links with src->gw and gw->target(condition)
+                entities["sequence_flows"] = [
+                    sf for sf in entities["sequence_flows"]
+                    if not (
+                        (sf.get("from_id") == src_task_id or sf.get("from_task_id") == src_task_id)
+                        and ((sf.get("to_id") in task_name_to_id.values()) or sf.get("to_task_id"))
+                        and str(sf.get("condition") or "").strip()
+                    )
+                ]
+                entities["sequence_flows"].append(
+                    {
+                        "from_id": src_task_id,
+                        "from_type": "task",
+                        "to_id": gw_id,
+                        "to_type": "gateway",
+                        "condition": "",
+                    }
+                )
+                for to_name, cond in items:
+                    tgt_task_id = task_name_to_id.get(to_name)
+                    if not tgt_task_id:
+                        continue
+                    key = (gw_id, tgt_task_id, cond)
+                    if key in synthesized_pairs:
+                        continue
+                    synthesized_pairs.add(key)
+                    entities["sequence_flows"].append(
+                        {
+                            "from_id": gw_id,
+                            "from_type": "gateway",
+                            "to_id": tgt_task_id,
+                            "to_type": "task",
+                            "condition": cond,
+                        }
+                    )
+
+        # Normalize gateway branch conditions from the beginning.
+        outgoing_by_gateway: dict[str, list[dict]] = {}
+        for sf in entities["sequence_flows"]:
+            if not isinstance(sf, dict):
+                continue
+            src = str(sf.get("from_id") or sf.get("from_task_id") or "").strip()
+            if not src:
+                continue
+            outgoing_by_gateway.setdefault(src, []).append(sf)
+
+        _bad_cond_norm = {
+            "조건1", "조건2", "조건3", "조건4", "조건5",
+            "분기1", "분기2", "분기3",
+            "case1", "case2", "case3",
+            "hastask", "hasinstruction", "performedby", "hasgateway", "hasevent",
+        }
+        for gw in entities["gateways"]:
+            if not isinstance(gw, Gateway):
+                continue
+            if gw.gateway_type != GatewayType.EXCLUSIVE:
+                continue
+            outs = outgoing_by_gateway.get(str(gw.gateway_id)) or []
+            if len(outs) < 2:
+                continue
+
+            for sf in outs:
+                cond = str(sf.get("condition") or "").strip()
+                cnorm = "".join(cond.lower().split())
+                if cnorm in _bad_cond_norm:
+                    sf["condition"] = ""
+
+            if len(outs) == 2:
+                c_true, c_false = self._derive_true_false_conditions(
+                    gateway_name=str(gw.name or ""),
+                    gateway_description=str(gw.description or ""),
+                )
+                if not str(outs[0].get("condition") or "").strip():
+                    outs[0]["condition"] = c_true
+                if not str(outs[1].get("condition") or "").strip():
+                    outs[1]["condition"] = c_false
+
         # Also create sequence flows from next_task/previous_task attributes
         for task in entities["tasks"]:
             if hasattr(task, '_next_task_name') and task._next_task_name:

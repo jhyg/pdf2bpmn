@@ -15,7 +15,8 @@ class VectorSearch:
         self.neo4j = neo4j_client
         self.embeddings = OpenAIEmbeddings(
             model=Config.OPENAI_EMBEDDING_MODEL,
-            api_key=Config.OPENAI_API_KEY
+            api_key=Config.OPENAI_API_KEY,
+            base_url=(Config.OPENAI_BASE_URL or None),
         )
         self.merge_threshold = Config.SIMILARITY_MERGE_THRESHOLD
         self.review_threshold = Config.SIMILARITY_REVIEW_THRESHOLD

@@ -1489,6 +1489,164 @@ class ProcessGPTBPMNXmlGenerator:
                 end = self.getPosition(targetPos, td)
                 self.createEdgeWaypoints(edge_el, start, end, isHorizontal)
 
+    def _normalize_runtime_model_to_elements(self, jsonModel: Dict[str, Any]) -> Dict[str, Any]:
+        model = dict(jsonModel or {})
+        if model.get("elements"):
+            return model
+
+        elements: List[Dict[str, Any]] = []
+
+        for ev in (model.get("events") or []):
+            if not isinstance(ev, dict):
+                continue
+            t = str(ev.get("type") or "").lower()
+            if "start" in t:
+                ev_type = "StartEvent"
+            elif "end" in t:
+                ev_type = "EndEvent"
+            else:
+                ev_type = "Event"
+            elements.append(
+                {
+                    "id": ev.get("id"),
+                    "name": ev.get("name") or "",
+                    "role": ev.get("role") or "",
+                    "type": ev_type,
+                    "eventType": ev.get("eventType") or ev.get("trigger") or "",
+                    "description": ev.get("description") or "",
+                    "source": "",
+                    "elementType": "Event",
+                }
+            )
+
+        for act in (model.get("activities") or []):
+            if not isinstance(act, dict):
+                continue
+            act_type_raw = str(act.get("type") or "").lower()
+            if "script" in act_type_raw:
+                act_type = "ScriptActivity"
+            elif "send" in act_type_raw or "email" in act_type_raw:
+                act_type = "EmailActivity"
+            elif "manual" in act_type_raw:
+                act_type = "ManualActivity"
+            elif "call" in act_type_raw:
+                act_type = "CallActivity"
+            else:
+                act_type = "UserActivity"
+
+            properties = act.get("properties")
+            if isinstance(properties, str):
+                try:
+                    parsed = json.loads(properties) if properties.strip() else {}
+                    properties = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    properties = {}
+            elif not isinstance(properties, dict):
+                properties = {}
+
+            merged_props: Dict[str, Any] = dict(properties)
+            for key in ("duration", "instruction", "tool", "agent", "agentMode", "orchestration", "attachments", "customProperties"):
+                if act.get(key) is not None:
+                    merged_props[key] = act.get(key)
+
+            elements.append(
+                {
+                    "id": act.get("id"),
+                    "name": act.get("name") or "",
+                    "role": act.get("role") or "",
+                    "type": act_type,
+                    "description": act.get("description") or "",
+                    "inputData": act.get("inputData") or [],
+                    "outputData": act.get("outputData") or [],
+                    "checkpoints": act.get("checkpoints") or [],
+                    "properties": merged_props,
+                    "elementType": "CallActivity" if act_type == "CallActivity" else "Activity",
+                }
+            )
+
+        for gw in (model.get("gateways") or []):
+            if not isinstance(gw, dict):
+                continue
+            gw_type_raw = str(gw.get("type") or gw.get("gateWayType") or "").lower()
+            gw_type = "bpmn:parallelGateway" if "parallel" in gw_type_raw else "bpmn:exclusiveGateway"
+            elements.append(
+                {
+                    "id": gw.get("id"),
+                    "name": gw.get("name") or "",
+                    "role": gw.get("role") or "",
+                    "description": gw.get("description") or "",
+                    "gateWayType": gw_type,
+                    "elementType": "Gateway",
+                }
+            )
+
+        for seq in (model.get("sequences") or []):
+            if not isinstance(seq, dict):
+                continue
+            elements.append(
+                {
+                    "id": seq.get("id"),
+                    "name": seq.get("name") or "",
+                    "source": seq.get("source"),
+                    "target": seq.get("target"),
+                    "condition": seq.get("condition") or "",
+                    "elementType": "Sequence",
+                }
+            )
+
+        model["elements"] = elements
+        return model
+
+    def _ensure_start_end_connectivity(self, jsonModel: Dict[str, Any]) -> Dict[str, Any]:
+        model = dict(jsonModel or {})
+        elems = model.get("elements")
+        if not isinstance(elems, list):
+            return model
+
+        events = [e for e in elems if isinstance(e, dict) and e.get("elementType") == "Event"]
+        seqs = [e for e in elems if isinstance(e, dict) and e.get("elementType") == "Sequence"]
+        nodes = [e for e in elems if isinstance(e, dict) and e.get("elementType") != "Sequence"]
+
+        outgoing: Dict[str, List[Dict[str, Any]]] = {}
+        incoming: Dict[str, List[Dict[str, Any]]] = {}
+        for s in seqs:
+            src = str(s.get("source") or "")
+            tgt = str(s.get("target") or "")
+            if not src or not tgt:
+                continue
+            outgoing.setdefault(src, []).append(s)
+            incoming.setdefault(tgt, []).append(s)
+
+        start_ids = {str(e.get("id")) for e in events if str(e.get("type") or "") == "StartEvent"}
+        end_ids = {str(e.get("id")) for e in events if str(e.get("type") or "") == "EndEvent"}
+        node_ids = {str(n.get("id")) for n in nodes if n.get("id")}
+
+        for end_id in end_ids:
+            if incoming.get(end_id):
+                continue
+            terminal_candidates = [
+                nid
+                for nid in node_ids
+                if nid not in end_ids and nid not in start_ids and not outgoing.get(nid)
+            ]
+            if not terminal_candidates:
+                continue
+            src = sorted(terminal_candidates)[-1]
+            new_seq = {
+                "id": f"seq_{src}_{end_id}",
+                "name": "",
+                "source": src,
+                "target": end_id,
+                "condition": "",
+                "elementType": "Sequence",
+            }
+            elems.append(new_seq)
+            outgoing.setdefault(src, []).append(new_seq)
+            incoming.setdefault(end_id, []).append(new_seq)
+
+        model["elements"] = elems
+        return model
+
     # ---------------------------
     # public API
     # ---------------------------
@@ -1497,6 +1655,8 @@ class ProcessGPTBPMNXmlGenerator:
         Backend equivalent of BPMNXmlGenerator.vue#createBpmnXml(jsonModel, horizontal)
         """
         jsonModel = dict(jsonModel or {})
+        jsonModel = self._normalize_runtime_model_to_elements(jsonModel)
+        jsonModel = self._ensure_start_end_connectivity(jsonModel)
         jsonModel["isAutoLayout"] = True
 
         isHorizontal = bool(jsonModel.get("isHorizontal"))

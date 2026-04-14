@@ -14,7 +14,6 @@ from .entities import (
     DMNDecision,
     DMNRule,
     Evidence,
-    Ambiguity,
     ReferenceChunk,
 )
 
@@ -58,12 +57,6 @@ class GraphState(TypedDict):
     
     # Evidence and tracking
     evidences: Annotated[list[Evidence], merge_list]
-    
-    # HITL
-    open_questions: Annotated[list[Ambiguity], merge_list]
-    resolved_questions: Annotated[list[Ambiguity], merge_list]
-    current_question: Ambiguity | None
-    user_answer: str | None
     
     # Control flow
     confidence_threshold: float

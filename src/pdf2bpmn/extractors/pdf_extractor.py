@@ -1,5 +1,6 @@
 """PDF text and structure extraction."""
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Generator
@@ -8,6 +9,14 @@ import pdfplumber
 
 from ..models.entities import Document, Section, ReferenceChunk, generate_id
 from ..config import Config
+
+
+def _llm_timeout_sec() -> float:
+    try:
+        v = float(os.getenv("OPENAI_TIMEOUT_SEC", "120"))
+    except Exception:
+        v = 120.0
+    return max(1.0, min(v, 120.0))
 
 
 class PDFExtractor:
@@ -58,16 +67,40 @@ class PDFExtractor:
                 all_text.append((i + 1, text))
 
             # Extract sections
-            # 1) SOP boundary detection (optional, more robust for manuals/SOP documents)
-            # 2) Fallback to heading detection
+            # 1) SOP boundary detection (optional, LLM-based)
+            # 2) Heading-based split
+            # 3) Choose strategy with a guard against over-collapsed single-SOP outputs
             sections = []
+            sop_sections: list[Section] = []
+            heading_sections: list[Section] = []
             if Config.ENABLE_SOP_SEGMENTATION and Config.OPENAI_API_KEY:
                 try:
-                    sections = self._extract_sop_sections(doc.doc_id, page_texts)
-                except Exception:
-                    sections = []
-            if not sections:
-                sections = self._extract_sections(doc.doc_id, all_text)
+                    sop_sections = self._extract_sop_sections(doc.doc_id, page_texts)
+                except Exception as e:
+                    print(f"[WARN] SOP segmentation failed, fallback to heading split: {e}")
+                    sop_sections = []
+
+            heading_sections = self._extract_sections(doc.doc_id, all_text)
+
+            if self._should_use_heading_sections(
+                sop_sections=sop_sections,
+                heading_sections=heading_sections,
+                page_count=page_count,
+            ):
+                sections = heading_sections
+                print(
+                    f"[SECTION-STRATEGY] using heading split "
+                    f"(sop={len(sop_sections)}, heading={len(heading_sections)}, pages={page_count})"
+                )
+            else:
+                sections = sop_sections or heading_sections
+                print(
+                    f"[SECTION-STRATEGY] using sop split "
+                    f"(sop={len(sop_sections)}, heading={len(heading_sections)}, pages={page_count})"
+                )
+
+            if Config.FORCE_SINGLE_SECTION:
+                sections = self._force_single_section(doc.doc_id, page_texts)
             
             # Create reference chunks
             if self.chunking_strategy == "semantic":
@@ -76,6 +109,51 @@ class PDFExtractor:
                 chunks = self._create_chunks(doc.doc_id, page_texts)
             
             return doc, sections, chunks
+
+    def _should_use_heading_sections(
+        self,
+        *,
+        sop_sections: list[Section],
+        heading_sections: list[Section],
+        page_count: int,
+    ) -> bool:
+        """
+        Choose heading-based sections when SOP segmentation looks over-collapsed.
+        This keeps behavior stable across model/provider differences.
+        """
+        if not heading_sections:
+            return False
+        if not sop_sections:
+            return True
+
+        # If SOP gives only one broad section while heading split finds multiple,
+        # prefer heading split for stability.
+        if len(sop_sections) == 1 and len(heading_sections) >= 2:
+            s = sop_sections[0]
+            spans_almost_all = (int(s.page_from) <= 1) and (int(s.page_to) >= max(1, page_count - 1))
+            if spans_almost_all or page_count >= 6:
+                return True
+        return False
+
+    def _force_single_section(self, doc_id: str, page_texts: dict[int, str]) -> list[Section]:
+        """Force all pages into exactly one section (temporary test bypass)."""
+        pages = sorted(page_texts.keys())
+        if not pages:
+            return []
+        combined = "\n\n".join((page_texts.get(p) or "").strip() for p in pages).strip()
+        if not combined:
+            return []
+        return [
+            Section(
+                section_id=generate_id(),
+                doc_id=doc_id,
+                heading="Forced Single Section",
+                level=1,
+                page_from=pages[0],
+                page_to=pages[-1],
+                content=combined,
+            )
+        ]
 
     def _extract_sop_sections(self, doc_id: str, page_texts: dict[int, str]) -> list[Section]:
         """
@@ -106,21 +184,112 @@ class PDFExtractor:
 
         prompt = ChatPromptTemplate.from_template(
             """당신은 문서 구조 분석 전문가입니다.
+가장 중요한 목표:
+- 목표는 문서를 최대한 많이 자르는 것이 아니라, **업무적으로 의미 있는 적절한 단위로 안정적으로 분할하는 것**입니다.
+
 주어진 문서에서 SOP(표준작업절차) 또는 독립적인 업무 프로세스의 경계를 식별해주세요.
 
 규칙:
 - 문서 제목 전체는 SOP가 아닐 수 있습니다. 문서 내부의 구체적인 업무 절차(요청관리, 변경관리, 장애관리 등)를 찾으세요.
 - SOP는 독립적인 시작/끝을 가진 절차 단위입니다.
 - 반환은 최대한 포괄적으로 하되, 과도하게 잘게 쪼개지 마세요.
+- 문서에 절/장/단계/프로세스 단위가 여러 개 보이면 SOP를 여러 개로 나누세요.
+- 서로 다른 목적/트리거/종료조건을 가진 절차는 반드시 별도 SOP로 분리하세요.
+- 전체 문서를 1개 SOP로 묶는 것은 정말 단일 절차 문서일 때만 허용됩니다.
+- 문서가 여러 페이지이거나 여러 장/절/단계/업무 항목을 포함하면, 특별한 사유가 없는 한 **최소 3개 이상의 SOP**를 우선 검토하세요.
+- 다만 과도한 세분화도 금지합니다. 한두 문단/사소한 문장 차이만으로 SOP를 새로 만들지 마세요.
+- SOP 하나는 어느 정도 독립적인 업무 목적/절차 흐름을 가져야 하며, 지나치게 잘게 쪼개어 20개, 30개, 40개 이상으로 불필요하게 분할하지 마세요.
+- 문서 구조를 존중하되, **비슷한 목적의 연속 단계**는 하나의 SOP로 묶으세요.
+- 경계가 보이면 분리하고, 비슷한 목적의 연속 단계는 묶어 **업무적으로 의미 있는 적절한 단위**로 분할하세요.
+
+- 새 SOP를 시작해야 하는 대표 조건(체크리스트):
+  - 업무 목적이 바뀜
+  - 주요 담당 역할/부서가 바뀜
+  - 주요 입력 문서나 출력 문서가 바뀜
+  - 승인/판단/검토 게이트가 새로 등장함
+  - 준비 단계에서 본처리 단계로 넘어감
+  - 처리 단계에서 결과 통보/사후관리 단계로 넘어감
+  - 앞 단계와 독립적으로 설명 가능한 새로운 절차 묶음이 시작됨
+
+- 새 SOP로 나누지 말아야 하는 대표 조건(체크리스트):
+  - 같은 목적의 연속 세부 단계
+  - 같은 역할이 이어서 수행하는 세부 작업 나열
+  - 단순 설명 보강, 예시, 주의사항
+  - 같은 절차 안의 하위 체크리스트
+  - 앞 절차의 세부 실행 방법만 더 자세히 풀어쓴 부분
+
+- 1개 SOP만 반환하는 것은 다음 경우에만 허용됩니다:
+  1) 문서 길이가 매우 짧고
+  2) 처음부터 끝까지 하나의 단일 절차만 설명하며
+  3) 준비/본처리/후속처리를 나눌 정도의 구조 변화가 전혀 없을 때
+- 문서가 6페이지 이상이거나, 제목/번호 체계가 여러 개 보이거나, 단계가 3개 이상 보이면 1개 SOP로 반환하지 마세요.
+- 한 SOP 안에 너무 많은 단계가 몰려 있으면 다음 기준으로 쪼개세요:
+  - 접수/준비 단계
+  - 검토/판단 단계
+  - 승인/처리 단계
+  - 결과 통보/사후관리 단계
+- 제목이 다르거나, 담당 역할이 크게 바뀌거나, 입력/출력 문서가 바뀌거나, 판단/승인 게이트가 새로 등장하면 새 SOP 시작으로 보세요.
+- page_from/page_to는 실제 경계를 반영해 겹침 없이 작성하세요.
+- 비슷한 하위 절차가 연속으로 반복될 때는 개별 단계마다 SOP를 만들지 말고 상위 절차 단위로 통합하세요.
+- 각 SOP 경계는 왜 분리되는지 내부적으로 판단하세요.
+- 경계 이유 없이 페이지를 기계적으로 자르지 마세요.
 
 응답 형식(JSON):
 {{"sops":[{{"title":"SOP 제목","page_from":1,"page_to":3}}]}}
+
+예시 1:
+- 문서 구성: 신청 접수 -> 서류 검토 -> 승인 심사 -> 결과 통보
+- 올바른 출력: 최소 3~4개 SOP
+  - 신청 접수
+  - 서류 검토
+  - 승인 심사
+  - 결과 통보
+- 잘못된 출력: 문서 전체를 1개 SOP로 묶음
+
+예시 2:
+- 문서에 "제1장 접수", "제2장 심사", "제3장 사후관리"가 보임
+- 올바른 출력:
+  - 접수 절차 (page_from/page_to)
+  - 심사 절차 (page_from/page_to)
+  - 사후관리 절차 (page_from/page_to)
+
+예시 3:
+- 같은 업무 문서라도 준비/처리/종료 단계가 뚜렷하면 별도 SOP로 분리
+- 예:
+  - 개최 준비
+  - 본 심의 진행
+  - 결과 통보 및 후속조치
+
+좋은 예시:
+- 신청 접수 / 서류 검토 / 승인 심사 / 결과 통보
+- 접수 절차 / 심사 절차 / 사후관리 절차
+
+나쁜 예시:
+- 신청서 열람 / 신청서 확인 / 신청서 저장 / 신청서 표시 를 각각 별도 SOP로 분리
+- 문서 전체를 무조건 1개 SOP로 묶기
+- 페이지 수만 보고 기계적으로 페이지당 1개 SOP로 자르기
+
+최종 판단 원칙:
+- 출력 전 반드시 스스로 점검하세요:
+  - 전체 문서를 1개로 과도하게 묶지 않았는가?
+  - 반대로 사소한 단계 차이만으로 과도하게 쪼개지 않았는가?
+  - 각 SOP는 독립적인 업무 목적과 흐름을 가지는가?
+- 1개로 과소분할하지 마세요.
+- 40개 이상처럼 과도하게 과분할하지 마세요.
+- 문서 구조가 보이면 그 구조를 적극 반영하세요.
+- 확신이 낮을 때는 무조건 합치거나 무조건 쪼개지 말고, 업무적으로 더 자연스러운 단위를 선택하세요.
 
 문서 내용:
 {text}
 """
         )
-        llm = ChatOpenAI(model=Config.OPENAI_MODEL, api_key=Config.OPENAI_API_KEY, temperature=0)
+        llm = ChatOpenAI(
+            model=Config.OPENAI_MODEL,
+            api_key=Config.OPENAI_API_KEY,
+            base_url=(Config.OPENAI_BASE_URL or None),
+            temperature=0,
+            timeout=_llm_timeout_sec(),
+        )
         parser = JsonOutputParser(pydantic_object=_SOPBoundaries)
         chain = prompt | llm | parser
         data = chain.invoke({"text": joined})
@@ -243,7 +412,13 @@ class PDFExtractor:
             image.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-            llm = ChatOpenAI(model=Config.OPENAI_MODEL, api_key=Config.OPENAI_API_KEY, temperature=0)
+            llm = ChatOpenAI(
+                model=Config.OPENAI_MODEL,
+                api_key=Config.OPENAI_API_KEY,
+                base_url=(Config.OPENAI_BASE_URL or None),
+                temperature=0,
+                timeout=_llm_timeout_sec(),
+            )
             prompt = (
                 "You are an OCR engine. Extract ALL readable Korean/English text from the image. "
                 "Preserve line breaks. Do not add commentary. Output plain text only."

@@ -94,6 +94,17 @@ def create_only_process_definition_system_instructions() -> str:
         "### (시퀀스/게이트웨이)\n"
         "- extracted.gateways / extracted.sequence_flows 정보가 있으면 반영\n"
         "- gateway를 만드는 경우 outgoing이 2개 이상이어야 하며, ExclusiveGateway면 각 outgoing condition을 한글로 채우세요\n"
+        "- gateway name은 절대로 '분기 1/분기 2' 같은 placeholder를 쓰지 마세요. gateway description/의사결정 의미를 반영한 이름으로 작성하세요.\n"
+        "- ExclusiveGateway가 2개 분기라면 condition을 true/false 의미가 드러나게 작성하세요.\n"
+        "  예: '<판단주제>인 경우' / '<판단주제>이 아닌 경우'\n"
+        "- condition은 절대로 '조건 1/조건 2/분기 1' 같은 자리표시자(placeholder)로 쓰지 마세요.\n"
+        "- extracted.sequence_flows.condition이 비어있는 경우에도, target activity name/description/instruction과 프로세스 문맥을 근거로 자연어 조건을 생성하세요.\n"
+        "- condition으로 'HAS_TASK', 'HAS_INSTRUCTION', 'PERFORMED_BY' 같은 그래프 관계명은 절대 사용하지 마세요.\n"
+        "- extracted에서 확인되는 instruction/description/role/task/flow는 누락하지 말고 가능한 범위에서 모두 반영하세요.\n"
+        "- 분기 판단 내용은 dmn_rules가 아니라 반드시 Sequence.condition에 직접 작성하세요.\n"
+        "- StartEvent에서 시작해 EndEvent에서 종료되도록 단절 없이 단일 방향 흐름을 보장하세요.\n"
+        "- EndEvent를 제외한 모든 Activity/Gateway는 최소 1개의 outgoing Sequence를 가져야 합니다.\n"
+        "- 마지막 업무 노드(terminal activity/gateway)는 반드시 EndEvent로 연결하세요.\n"
     )
 
 
@@ -106,10 +117,13 @@ def process_quality_system_instructions() -> str:
         "### (추가) BPMN 품질/정합성 강화 규칙\n"
         "- Gateway를 생성하는 경우, 반드시 **최소 2개 이상의 outgoing Sequence**가 있어야 합니다.\n"
         "- ExclusiveGateway: outgoing 각각에 condition(한글)을 반드시 지정하세요.\n"
+        "- Gateway 이름은 description과 일치하는 의사결정명이어야 하며, '분기1/2' 같은 이름은 금지입니다.\n"
+        "- condition은 '조건 1/조건 2' 같은 자리표시자 금지. 반드시 비즈니스 의미(승인/반려/요건충족/미충족 등)를 담으세요.\n"
         "- ParallelGateway: condition은 비워두고, 분기/병합 구조가 자연스럽게 되도록 설계하세요.\n"
         "- Gateway가 있는데 분기가 1개 뿐이라면 Gateway를 만들지 말고 직선 흐름으로 연결하세요.\n"
         "- 모든 Activity/Event/Gateway는 startEvent에서 시작해 endEvent로 끝나도록 **끊김 없이** 연결되어야 합니다.\n"
         "- Sequence는 항상 source/target을 가져야 하며, 고아 노드(연결되지 않은 노드)를 만들지 마세요.\n"
+        "- EndEvent는 반드시 incoming Sequence를 1개 이상 가져야 하며, 흐름이 중간에서 끊기면 안 됩니다.\n"
     )
 
 

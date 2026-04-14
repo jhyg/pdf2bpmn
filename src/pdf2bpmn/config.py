@@ -10,11 +10,18 @@ load_dotenv()
 class Config:
     """Application configuration."""
     
+    # Unified LLM proxy settings (OpenAI-compatible API)
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "").strip()
+    LLM_PROXY_URL: str = os.getenv("LLM_PROXY_URL", "").strip()
+    LLM_PROXY_API_KEY: str = os.getenv("LLM_PROXY_API_KEY", "").strip()
+
     # OpenAI
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_API_KEY: str = LLM_PROXY_API_KEY or os.getenv("OPENAI_API_KEY", "")
     # Default to gpt-4.1 for longer, more stable structured outputs.
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4.1")
+    OPENAI_MODEL: str = LLM_MODEL or os.getenv("OPENAI_MODEL", "gpt-4.1")
     OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    # OpenAI-compatible endpoint (e.g., OpenRouter: https://openrouter.ai/api/v1)
+    OPENAI_BASE_URL: str = LLM_PROXY_URL or os.getenv("OPENAI_BASE_URL", "")
     
     # Neo4j
     NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -59,6 +66,9 @@ class Config:
     # Performance optimization options
     EVIDENCE_MODE: str = os.getenv("EVIDENCE_MODE", "full")  # "full", "reference_only", "off"
     CHUNKING_STRATEGY: str = os.getenv("CHUNKING_STRATEGY", "fixed")  # "fixed", "semantic"
+    # Temporary bypass switch for local tests:
+    # when true, force EXTRACT LLM input sections to exactly one section.
+    FORCE_SINGLE_SECTION: bool = os.getenv("FORCE_SINGLE_SECTION", "false").lower() == "true"
     
     @classmethod
     def ensure_dirs(cls):

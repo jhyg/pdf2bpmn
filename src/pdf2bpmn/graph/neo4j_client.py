@@ -1591,6 +1591,32 @@ class Neo4jClient:
             except Exception:
                 return None
 
+    def get_latest_request_process_graph_by_proc_id(self, proc_id: str) -> Optional[dict]:
+        """Fetch latest process graph snapshot by proc_id across all runs."""
+        if not proc_id:
+            return None
+        with self.session() as session:
+            rec = session.run(
+                """
+                MATCH (r:GraphRun)-[:HAS_SNAPSHOT]->(s:GraphSnapshot {snapshot_type: 'process', proc_id: $proc_id})
+                RETURN r.run_id as run_id, r.task_id as task_id, s.payload_json as payload_json, s.created_at as created_at
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                {"proc_id": proc_id},
+            ).single()
+            if not rec:
+                return None
+            try:
+                payload = json.loads(rec["payload_json"] or "{}")
+                if isinstance(payload, dict):
+                    payload.setdefault("run_id", rec.get("run_id"))
+                    payload.setdefault("task_id", rec.get("task_id"))
+                    payload.setdefault("proc_id", proc_id)
+                return payload
+            except Exception:
+                return None
+
     def get_latest_integrated_graph_by_proc_id(self, proc_id: str) -> Optional[dict]:
         """
         Fetch latest integrated graph snapshot by proc_id.

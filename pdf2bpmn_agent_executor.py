@@ -263,17 +263,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         self.supabase_key = os.getenv('SERVICE_ROLE_KEY')
         self.supabase_client: Optional[Client] = None
 
-        # OpenAI client (for form generation)
-        self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        # OpenAI-compatible client (for form generation)
+        self.openai_api_key = (os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+        self.openai_base_url = (os.getenv("LLM_PROXY_URL") or os.getenv("OPENAI_BASE_URL") or "").strip()
+        # Keep for logging/debug compatibility only.
+        self.openai_timeout_sec = 0.0
         # Default to gpt-4.1 for longer, more stable structured outputs.
-        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1")
+        self.openai_model = (os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1").strip()
         # Separate models (requested: user/agent creation vs process creation)
         self.user_mapping_model = os.getenv("USER_MAPPING_MODEL", self.openai_model)
         self.process_definition_model = os.getenv("PROCESS_DEF_MODEL", self.openai_model)
         self.openai_client: Optional[OpenAI] = None
         if OPENAI_AVAILABLE and self.openai_api_key:
             try:
-                self.openai_client = OpenAI(api_key=self.openai_api_key)
+                client_kwargs = {"api_key": self.openai_api_key}
+                if self.openai_base_url:
+                    client_kwargs["base_url"] = self.openai_base_url
+                self.openai_client = OpenAI(**client_kwargs)
             except Exception as e:
                 logger.warning(f"[WARN] OpenAI client init failed: {e}")
                 self.openai_client = None
@@ -304,6 +310,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # LLM-based assignment controls
         # - ENABLE_LLM_ROLE_MAPPING: allow LLM to suggest best assignee (existing user/agent/team)
         self._enable_llm_role_mapping: bool = os.getenv("ENABLE_LLM_ROLE_MAPPING", "true").lower() == "true"
+        # Temporary runtime switch:
+        # - false: skip skill document generation/upload/sync paths
+        self._enable_skill_generation: bool = os.getenv("ENABLE_SKILL_GENERATION", "false").lower() == "true"
+        # Process definition generation mode:
+        # - true: use LLM generation first, then fallback/normalize
+        # - false: skip LLM and build deterministic definition from extracted data
+        self._use_llm_procdef_enrich: bool = os.getenv("USE_LLM_PROCDEF_ENRICH", "true").lower() == "true"
         self._llm_assignment_min_conf: float = float(os.getenv("LLM_ASSIGNMENT_MIN_CONFIDENCE", "0.72"))
 
         # In-run cache to avoid repeated LLM calls per role name
@@ -406,6 +419,59 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             return 0.0
         denom = max(len(a_tokens), 1)
         return min(0.9, len(overlap) / denom)
+
+    def _match_skill_score_for_agent(
+        self,
+        *,
+        agent_profile: Dict[str, Any],
+        skill_meta: Dict[str, Any],
+        activity_text: str = "",
+        role_hints: Optional[Set[str]] = None,
+    ) -> float:
+        """Agent profile + assigned activities 기반 스킬 적합도 점수(0~1)."""
+        role_hints = role_hints or set()
+        profile_text = " ".join(
+            str(x or "")
+            for x in (
+                agent_profile.get("username"),
+                agent_profile.get("role"),
+                agent_profile.get("goal"),
+                agent_profile.get("persona"),
+                agent_profile.get("tools"),
+                " ".join(sorted(role_hints)),
+                activity_text or "",
+            )
+        )
+        skill_text = " ".join(
+            str(x or "")
+            for x in (
+                skill_meta.get("name"),
+                skill_meta.get("summary"),
+                skill_meta.get("purpose"),
+                skill_meta.get("procedure_text"),
+            )
+        )
+
+        p_norm = self._normalize_text_key(profile_text)
+        s_norm = self._normalize_text_key(skill_text)
+        if not p_norm or not s_norm:
+            return 0.0
+
+        if p_norm in s_norm or s_norm in p_norm:
+            return 0.95
+
+        p_tokens = {t for t in p_norm.split() if len(t) >= 2}
+        s_tokens = {t for t in s_norm.split() if len(t) >= 2}
+        if not p_tokens or not s_tokens:
+            return 0.0
+        overlap = p_tokens & s_tokens
+        if not overlap:
+            return 0.0
+
+        # weighted overlap: profile relevance + activity evidence
+        jaccard = len(overlap) / max(len(p_tokens | s_tokens), 1)
+        coverage = len(overlap) / max(len(s_tokens), 1)
+        return min(0.98, (jaccard * 0.55) + (coverage * 0.45))
 
     def _build_skill_zip_bytes(self, *, skill_name: str, file_name: str, content: str) -> bytes:
         """`/skills/upload`용 zip 바이트 생성(내부에 반드시 SKILL.md 포함)."""
@@ -644,7 +710,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     async def _call_openai_for_form_html(self, request_text: str) -> str:
         """LLM 호출로 폼 HTML 생성. 실패 시 예외를 던집니다(상위에서 폴백 처리)."""
         if not self.openai_client:
-            raise RuntimeError("OpenAI client is not configured (missing OPENAI_API_KEY or openai package).")
+            raise RuntimeError("OpenAI client is not configured (missing LLM_PROXY_API_KEY/OPENAI_API_KEY or openai package).")
 
         messages = self._build_form_generator_base_messages()
         # FormDesignGenerator의 noteMessage와 유사: alias는 한국어, name은 영어 권장
@@ -667,6 +733,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 max_tokens=int(os.getenv("FORM_LLM_MAX_TOKENS", "2500")),
             )
 
+        # 원복: 헤지/하드타임아웃 없이 응답 완료까지 대기
         resp = await asyncio.to_thread(_run)
         content = (resp.choices[0].message.content or "").strip()
         if not content:
@@ -860,13 +927,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         total = len(activities)
         forms_by_activity_id: Dict[str, Dict[str, Any]] = {}
         max_forms = int(os.getenv("FORM_MAX_PER_PROCESS", "200"))
+        form_llm_concurrency = max(1, int(os.getenv("FORM_LLM_CONCURRENCY", "4")))
         if total > max_forms:
             activities = activities[:max_forms]
             total = len(activities)
+        sem = asyncio.Semaphore(form_llm_concurrency)
 
-        for idx, a in enumerate(activities):
+        async def _process_one_form(idx: int, a: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
             if not isinstance(a, dict):
-                continue
+                return False, "", {}
 
             activity_id = str(a.get("id") or f"Activity_{idx+1}")
             activity_name = str(a.get("name") or f"활동 {idx+1}")
@@ -910,42 +979,34 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 f"- 태스크 정보가 충분하지 않다면, 자유입력(Free Input) 중심의 폼이 생성되어도 괜찮습니다.\n"
             )
 
-            html = ""
-            # 1) LLM 시도
-            try:
-                per_form_timeout = float(os.getenv("FORM_LLM_TIMEOUT_SEC", "120"))
-                html = await asyncio.wait_for(self._call_openai_for_form_html(request_text), timeout=per_form_timeout)
-            except Exception as e:
-                # 운영상 폼은 반드시 존재해야 하므로 폴백 폼으로 진행
-                logger.warning(f"[WARN] form LLM failed. process={proc_def_id} activity={activity_id} err={e}")
-                html = self._make_fallback_form_html()
+            async with sem:
+                html = ""
+                # 1) LLM 시도
+                try:
+                    html = await self._call_openai_for_form_html(request_text)
+                except Exception as e:
+                    # 운영상 폼은 반드시 존재해야 하므로 폴백 폼으로 진행
+                    logger.warning(f"[WARN] form LLM failed. process={proc_def_id} activity={activity_id} err={e}")
+                    html = self._make_fallback_form_html()
 
-            # 2) fields_json 추출
-            try:
-                fields_json = self._extract_fields_json_from_form_html(html)
-            except Exception as e:
-                logger.warning(f"[WARN] fields_json extract failed. fallback empty. err={e}")
-                fields_json = []
+                # 2) fields_json 추출
+                try:
+                    fields_json = self._extract_fields_json_from_form_html(html)
+                except Exception as e:
+                    logger.warning(f"[WARN] fields_json extract failed. fallback empty. err={e}")
+                    fields_json = []
 
-            # 3) 저장
-            ok = await self._save_form_def(
-                form_def={
-                    "id": form_def_id,
-                    "html": html,
-                    "proc_def_id": proc_def_id,
-                    "activity_id": activity_id,
-                    "fields_json": fields_json,
-                },
-                tenant_id=tenant_id,
-            )
-            if ok:
-                forms_saved += 1
-
-            # Always keep an index for post-processing (even if save failed).
-            forms_by_activity_id[activity_id] = {
-                "form_id": form_def_id,
-                "fields_json": fields_json,
-            }
+                # 3) 저장
+                ok = await self._save_form_def(
+                    form_def={
+                        "id": form_def_id,
+                        "html": html,
+                        "proc_def_id": proc_def_id,
+                        "activity_id": activity_id,
+                        "fields_json": fields_json,
+                    },
+                    tenant_id=tenant_id,
+                )
 
             await self._send_progress_event(
                 event_queue,
@@ -957,6 +1018,26 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 95,
                 {"proc_def_id": proc_def_id, "activity_id": activity_id, "form_def_id": form_def_id, "saved": ok},
             )
+
+            return ok, activity_id, {"form_id": form_def_id, "fields_json": fields_json}
+
+        form_tasks: List[asyncio.Task] = []
+        for idx, a in enumerate(activities):
+            if not isinstance(a, dict):
+                continue
+            form_tasks.append(asyncio.create_task(_process_one_form(idx, a)))
+
+        if form_tasks:
+            results = await asyncio.gather(*form_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.warning(f"[WARN] form task failed unexpectedly: {res}")
+                    continue
+                ok, activity_id, form_meta = res
+                if ok:
+                    forms_saved += 1
+                if activity_id:
+                    forms_by_activity_id[activity_id] = form_meta
 
         return {"forms_saved": forms_saved, "activities": total, "forms": forms_by_activity_id}
 
@@ -1800,6 +1881,52 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     def _normalize_text_key(self, s: str) -> str:
         return re.sub(r"\s+", "", (s or "").strip().lower())
 
+    def _is_placeholder_gateway_name(self, name: str) -> bool:
+        key = self._normalize_text_key(name)
+        if not key:
+            return True
+        if re.match(r"^(분기|gateway|gw|decision)\d*$", key):
+            return True
+        if re.match(r"^(분기|gateway|gw|decision)[_-]?\d+$", key):
+            return True
+        return False
+
+    def _gateway_subject_from_text(self, text: str) -> str:
+        s = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not s:
+            return ""
+        s = re.sub(r"[\"'`]+", "", s)
+        for p in (r"(.+?)(?:인지|인가)\s*여부", r"(.+?)\s*여부"):
+            m = re.search(p, s)
+            if m:
+                subj = re.sub(r"\s+", " ", (m.group(1) or "")).strip(" .,-_")
+                if subj:
+                    return subj
+        # 흔한 게이트웨이 접미어/불용어 제거(폴백)
+        for tok in ("분기", "판단", "확인", "검토", "결정", "여부"):
+            s = s.replace(tok, " ")
+        s = re.sub(r"\s+", " ", s).strip(" .,-_")
+        return s
+
+    def _derive_gateway_name(self, *, raw_name: str, description: str, idx: int) -> str:
+        name = str(raw_name or "").strip()
+        # description에서 주제가 잡히면 초기 이름도 항상 해당 규칙으로 통일
+        subject = self._gateway_subject_from_text(description)
+        if subject:
+            return f"{subject} 여부 판단"
+        if name and not self._is_placeholder_gateway_name(name):
+            return name
+        subject = self._gateway_subject_from_text(name)
+        if subject:
+            return f"{subject} 여부 판단"
+        return f"의사결정 분기 {idx}"
+
+    def _derive_true_false_conditions(self, *, gateway_name: str, gateway_description: str) -> Tuple[str, str]:
+        subject = self._gateway_subject_from_text(gateway_description) or self._gateway_subject_from_text(gateway_name)
+        if subject:
+            return (f"{subject}인 경우", f"{subject}이 아닌 경우")
+        return ("조건 충족인 경우", "조건 미충족인 경우")
+
     def _safe_json_loads(self, v: Any) -> Any:
         if isinstance(v, str):
             try:
@@ -2138,15 +2265,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         max_tokens=max_tokens,
                     )
 
+            # 원복: 헤지/하드타임아웃 없이 응답 완료까지 대기
             resp = await asyncio.to_thread(_run)
             content = (resp.choices[0].message.content or "").strip()
             if not content:
                 return None
-            # strip code fences if present
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.IGNORECASE)
-            if m:
-                content = m.group(1).strip()
-            return json.loads(content)
+            parsed = self._parse_json_response_content(content)
+            if isinstance(parsed, dict):
+                return parsed
+            return None
         except Exception as e:
             logger.warning(f"[WARN] OpenAI JSON call failed: {e}")
             return None
@@ -2163,6 +2290,44 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         e = text.rfind("}")
         if s != -1 and e != -1 and e > s:
             return text[s : e + 1].strip()
+        return None
+
+    def _parse_json_response_content(self, content: str) -> Optional[Any]:
+        """
+        JSON 파싱 보강:
+        - raw json
+        - fenced json
+        - first '{' ~ last '}' span
+        - 개행/탭 정규화 재시도
+        """
+        raw = (content or "").strip()
+        if not raw:
+            return None
+
+        candidates: List[str] = [raw]
+        block = self._extract_json_block_from_markdown(raw)
+        if block and block not in candidates:
+            candidates.append(block)
+
+        if "{" in raw and "}" in raw:
+            s = raw.find("{")
+            e = raw.rfind("}")
+            if e > s:
+                span = raw[s : e + 1].strip()
+                if span and span not in candidates:
+                    candidates.append(span)
+
+        for cand in candidates:
+            try:
+                return json.loads(cand)
+            except Exception:
+                pass
+            try:
+                c2 = re.sub(r"[\r\n\t]+", " ", cand)
+                c2 = re.sub(r"\s{2,}", " ", c2).strip()
+                return json.loads(c2)
+            except Exception:
+                pass
         return None
 
     async def _call_openai_process_definition(
@@ -2320,96 +2485,82 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 os.getenv("LLM_PROCESS_TEMPERATURE", "0.0"),
             )
         )
-
-        # Retry a few times because a single invalid character breaks JSON parsing.
-        for attempt in range(1, 4):
-            attempt_messages = messages
-            if attempt > 1:
-                attempt_messages = list(messages) + [
-                    {
-                        "role": "system",
-                        "content": (
-                            "이전 응답은 JSON 파싱에 실패했습니다.\n"
-                            "이번에는 **단 하나의 JSON 객체만** 출력하세요.\n"
-                            "- 마크다운/설명/코드블록/백틱/주석 금지\n"
-                            "- JSON 외 텍스트가 1글자라도 있으면 실패\n"
-                        ),
-                    }
-                ]
-            try:
-                def _run():
-                    # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
-                    try:
-                        return self.openai_client.chat.completions.create(
-                            model=self.process_definition_model,
-                            messages=attempt_messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            response_format={"type": "json_object"},
-                        )
-                    except TypeError:
-                        return self.openai_client.chat.completions.create(
-                            model=self.process_definition_model,
-                            messages=attempt_messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                        )
-
-                resp = await asyncio.to_thread(_run)
-                content = (resp.choices[0].message.content or "").strip()
-                if not content:
-                    logger.warning(
-                        f"[PROCDEF][LLM] empty content returned (attempt={attempt}/3, model={self.process_definition_model})"
-                    )
-                    continue
-
-                # First try: content itself is JSON (when response_format=json_object worked)
+        try:
+            def _run():
+                # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
                 try:
-                    parsed = _loads_with_newlines_removed(content)
+                    return self.openai_client.chat.completions.create(
+                        model=self.process_definition_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        response_format={"type": "json_object"},
+                    )
+                except TypeError:
+                    return self.openai_client.chat.completions.create(
+                        model=self.process_definition_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+
+            # 원복: 헤지/하드타임아웃 없이 응답 완료까지 대기
+            resp = await asyncio.to_thread(_run)
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                logger.warning(
+                    f"[PROCDEF][LLM] empty content returned (model={self.process_definition_model})"
+                )
+                return None
+
+            # First try: content itself is JSON (when response_format=json_object worked)
+            try:
+                parsed = _loads_with_newlines_removed(content)
+                if isinstance(parsed, dict):
+                    elems = parsed.get("elements")
+                    elems_len = len(elems) if isinstance(elems, list) else None
+                    logger.info(
+                        f"[PROCDEF][LLM] parsed ok (keys={list(parsed.keys())}, elements_len={elems_len})"
+                    )
+                else:
+                    logger.warning(
+                        f"[PROCDEF][LLM] parsed non-dict JSON (type={type(parsed).__name__})"
+                    )
+                return parsed
+            except json.JSONDecodeError:
+                # Fallback: attempt to recover JSON from markdown/codefence responses
+                json_block = self._extract_json_block_from_markdown(content) or ""
+                if not json_block:
+                    logger.warning(
+                        "[PROCDEF][LLM] JSON decode failed and no JSON block recovered "
+                        f"(content_preview={content[:300]!r})"
+                    )
+                    return None
+                try:
+                    parsed = _loads_with_newlines_removed(json_block)
                     if isinstance(parsed, dict):
                         elems = parsed.get("elements")
                         elems_len = len(elems) if isinstance(elems, list) else None
                         logger.info(
-                            f"[PROCDEF][LLM] parsed ok (attempt={attempt}/3, keys={list(parsed.keys())}, elements_len={elems_len})"
+                            f"[PROCDEF][LLM] parsed ok from recovered block (keys={list(parsed.keys())}, elements_len={elems_len})"
                         )
                     else:
                         logger.warning(
-                            f"[PROCDEF][LLM] parsed non-dict JSON (attempt={attempt}/3, type={type(parsed).__name__})"
+                            f"[PROCDEF][LLM] parsed non-dict JSON from recovered block (type={type(parsed).__name__})"
                         )
                     return parsed
                 except json.JSONDecodeError:
-                    # Fallback: attempt to recover JSON from markdown/codefence responses
-                    json_block = self._extract_json_block_from_markdown(content) or ""
-                    if not json_block:
-                        logger.warning(
-                            "[PROCDEF][LLM] JSON decode failed and no JSON block recovered "
-                            f"(attempt={attempt}/3, content_preview={content[:300]!r})"
-                        )
-                        continue
-                    try:
-                        parsed = _loads_with_newlines_removed(json_block)
-                        if isinstance(parsed, dict):
-                            elems = parsed.get("elements")
-                            elems_len = len(elems) if isinstance(elems, list) else None
-                            logger.info(
-                                f"[PROCDEF][LLM] parsed ok from recovered block (attempt={attempt}/3, keys={list(parsed.keys())}, elements_len={elems_len})"
-                            )
-                        else:
-                            logger.warning(
-                                f"[PROCDEF][LLM] parsed non-dict JSON from recovered block (attempt={attempt}/3, type={type(parsed).__name__})"
-                            )
-                        return parsed
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "[PROCDEF][LLM] JSON decode failed even after block recovery "
-                            f"(attempt={attempt}/3, block_preview={json_block[:300]!r}, content_preview={content[:300]!r})"
-                        )
-                        continue
-            except Exception as e:
-                logger.warning(f"[WARN] OpenAI process-definition call failed (attempt {attempt}/3): {e}")
-                continue
-
-        return None
+                    logger.warning(
+                        "[PROCDEF][LLM] JSON decode failed even after block recovery "
+                        f"(block_preview={json_block[:300]!r}, content_preview={content[:300]!r})"
+                    )
+                    return None
+        except Exception as e:
+            logger.exception(
+                f"[WARN] OpenAI process-definition call failed "
+                f"(model={self.process_definition_model}): {type(e).__name__}: {e}"
+            )
+            return None
 
     async def _call_openai_json_messages(
         self,
@@ -2441,16 +2592,20 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         max_tokens=max_tokens,
                     )
 
+            # 원복: 헤지/하드타임아웃 없이 응답 완료까지 대기
             resp = await asyncio.to_thread(_run)
             content = (resp.choices[0].message.content or "").strip()
             if not content:
                 return None
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.IGNORECASE)
-            if m:
-                content = m.group(1).strip()
-            return json.loads(content)
+            parsed = self._parse_json_response_content(content)
+            if isinstance(parsed, dict):
+                return parsed
+            return None
         except Exception as e:
-            logger.warning(f"[WARN] OpenAI JSON(messages) call failed: {e}")
+            logger.warning(
+                f"[WARN] OpenAI JSON(messages) call failed: {type(e).__name__}: {e} "
+                f"(model={model or self.openai_model})"
+            )
             return None
 
     async def _generate_process_outline_via_consulting_prompt(
@@ -2689,6 +2844,742 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         s = re.sub(r"[^a-z0-9_]+", "_", s)
         s = re.sub(r"_+", "_", s).strip("_")
         return s
+
+    def _should_fallback_to_extracted_elements(
+        self,
+        *,
+        elements_model: Dict[str, Any],
+        extracted: Dict[str, Any],
+        process_name: str,
+    ) -> tuple[bool, str]:
+        """LLM 결과가 추출 데이터 대비 지나치게 빈약하면 extracted 기반 생성으로 폴백."""
+        elems = elements_model.get("elements")
+        if not isinstance(elems, list):
+            return True, "elements_missing_or_not_list"
+
+        llm_events = 0
+        llm_activities = 0
+        llm_gateways = 0
+        llm_sequences = 0
+        for e in elems:
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("elementType") or "").strip().lower()
+            if et == "event":
+                llm_events += 1
+            elif et == "activity":
+                llm_activities += 1
+            elif et == "gateway":
+                llm_gateways += 1
+            elif et == "sequence":
+                llm_sequences += 1
+
+        ex_tasks = extracted.get("tasks") or extracted.get("activities") or []
+        ex_roles = extracted.get("roles") or []
+        ex_gateways = extracted.get("gateways") or []
+        ex_events = extracted.get("events") or []
+        ex_flows = extracted.get("sequence_flows") or extracted.get("flows") or []
+
+        ex_tasks_n = len(ex_tasks) if isinstance(ex_tasks, list) else 0
+        ex_roles_n = len(ex_roles) if isinstance(ex_roles, list) else 0
+        ex_gateways_n = len(ex_gateways) if isinstance(ex_gateways, list) else 0
+        ex_events_n = len(ex_events) if isinstance(ex_events, list) else 0
+        ex_flows_n = len(ex_flows) if isinstance(ex_flows, list) else 0
+
+        if ex_tasks_n > 0 and llm_activities == 0:
+            return True, "no_activities_while_extracted_has_tasks"
+        if ex_gateways_n > 0 and llm_gateways == 0 and ex_gateways_n >= 2:
+            return True, "no_gateways_while_extracted_has_gateways"
+        if ex_flows_n > 2 and llm_sequences <= 1:
+            return True, "no_sequences_while_extracted_has_flows"
+        if ex_events_n >= 4 and llm_events <= 2 and llm_activities <= 1:
+            return True, "event_count_collapsed_to_start_end_only"
+
+        logger.info(
+            f"[PROCDEF][FALLBACK-CHECK] keep_llm process={process_name!r} "
+            f"llm(events={llm_events},activities={llm_activities},gateways={llm_gateways},sequences={llm_sequences}) "
+            f"extracted(tasks={ex_tasks_n},roles={ex_roles_n},gateways={ex_gateways_n},events={ex_events_n},flows={ex_flows_n})"
+        )
+        return False, "ok"
+
+    def _build_elements_model_from_extracted(
+        self,
+        *,
+        process_name: str,
+        extracted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """추출 결과를 기준으로 ProcessGPT elements 모델을 강제 구성."""
+        tasks = extracted.get("tasks") or extracted.get("activities") or []
+        roles = extracted.get("roles") or []
+        gateways = extracted.get("gateways") or []
+        sequence_flows = extracted.get("sequence_flows") or extracted.get("flows") or []
+
+        if not isinstance(tasks, list):
+            tasks = []
+        if not isinstance(roles, list):
+            roles = []
+        if not isinstance(gateways, list):
+            gateways = []
+        if not isinstance(sequence_flows, list):
+            sequence_flows = []
+
+        # roles
+        role_names: List[str] = []
+        for r in roles:
+            if not isinstance(r, dict):
+                continue
+            rn = str(r.get("name") or r.get("role") or "").strip()
+            if rn and rn not in role_names:
+                role_names.append(rn)
+        if not role_names:
+            for t in tasks:
+                if not isinstance(t, dict):
+                    continue
+                rn = str(t.get("performer_role") or t.get("role") or "").strip()
+                if rn and rn not in role_names:
+                    role_names.append(rn)
+        if not role_names:
+            role_names = ["담당자"]
+
+        role_rows = [
+            {
+                "name": rn,
+                "endpoint": f"role_{self._snake_id(rn) or 'owner'}",
+                "resolutionRule": "",
+                "origin": "created",
+            }
+            for rn in role_names
+        ]
+        default_role = role_names[0]
+
+        # node registry
+        node_name_to_id: Dict[str, str] = {}
+        activity_rows: List[Dict[str, Any]] = []
+        gateway_rows: List[Dict[str, Any]] = []
+
+        # activities from tasks
+        sorted_tasks: List[Dict[str, Any]] = []
+        for t in tasks:
+            if isinstance(t, dict):
+                sorted_tasks.append(t)
+        sorted_tasks.sort(
+            key=lambda x: (
+                10**9 if x.get("order") is None else int(x.get("order") or 0),
+                str(x.get("name") or ""),
+            )
+        )
+
+        for idx, t in enumerate(sorted_tasks, start=1):
+            name = str(t.get("name") or "").strip() or f"활동 {idx}"
+            aid = self._snake_id(str(t.get("task_id") or t.get("id") or f"task_{idx}")) or f"task_{idx}"
+            role = str(t.get("performer_role") or t.get("role") or default_role).strip() or default_role
+            instruction = str(t.get("instruction") or "").strip()
+            description = str(t.get("description") or "").strip()
+
+            activity_rows.append(
+                {
+                    "elementType": "Activity",
+                    "id": aid,
+                    "name": name,
+                    "role": role,
+                    "type": "UserActivity",
+                    "source": "",
+                    "description": description,
+                    "instruction": instruction,
+                    "inputData": [],
+                    "outputData": [f"{name} 결과"],
+                    "checkpoints": [],
+                    "duration": "5",
+                }
+            )
+            node_name_to_id[name.lower().strip()] = aid
+
+        # gateways
+        for idx, g in enumerate(gateways, start=1):
+            if not isinstance(g, dict):
+                continue
+            description = str(g.get("description") or "").strip()
+            name = self._derive_gateway_name(
+                raw_name=str(g.get("name") or "").strip(),
+                description=description,
+                idx=idx,
+            )
+            gid = self._snake_id(str(g.get("gateway_id") or g.get("id") or f"gateway_{idx}")) or f"gateway_{idx}"
+            gw_type = str(g.get("gateway_type") or g.get("type") or "ExclusiveGateway").strip()
+            gw_low = gw_type.lower()
+            if "parallel" in gw_low:
+                gw_type = "ParallelGateway"
+            elif "inclusive" in gw_low:
+                gw_type = "InclusiveGateway"
+            else:
+                gw_type = "ExclusiveGateway"
+            role = str(g.get("role") or default_role).strip() or default_role
+            gateway_rows.append(
+                {
+                    "elementType": "Gateway",
+                    "id": gid,
+                    "name": name,
+                    "role": role,
+                    "source": "",
+                    "type": gw_type,
+                    "description": description,
+                }
+            )
+            node_name_to_id[name.lower().strip()] = gid
+
+        start_id = "start_event"
+        end_id = "end_event"
+        elements: List[Dict[str, Any]] = [
+            {
+                "elementType": "Event",
+                "id": start_id,
+                "name": "프로세스 시작",
+                "role": default_role,
+                "source": "",
+                "type": "StartEvent",
+                "description": "",
+                "trigger": "",
+            }
+        ]
+        elements.extend(activity_rows)
+        elements.extend(gateway_rows)
+        elements.append(
+            {
+                "elementType": "Event",
+                "id": end_id,
+                "name": "프로세스 종료",
+                "role": default_role,
+                "source": "",
+                "type": "EndEvent",
+                "description": "",
+                "trigger": "",
+            }
+        )
+
+        seqs: List[Dict[str, Any]] = []
+        seen_seq: Set[Tuple[str, str, str]] = set()
+
+        def _resolve_node_id(name_or_id: Any) -> str:
+            raw = str(name_or_id or "").strip()
+            if not raw:
+                return ""
+            key = raw.lower().strip()
+            if key in node_name_to_id:
+                return node_name_to_id[key]
+            raw_snake = self._snake_id(raw)
+            for e in elements:
+                if str(e.get("id") or "") == raw_snake:
+                    return raw_snake
+            return ""
+
+        # explicit extracted sequence flows
+        for f in sequence_flows:
+            if not isinstance(f, dict):
+                continue
+            src = _resolve_node_id(
+                f.get("source")
+                or f.get("from_id")
+                or f.get("from_task_id")
+                or f.get("from_task")
+                or f.get("from_name")
+            )
+            tgt = _resolve_node_id(
+                f.get("target")
+                or f.get("to_id")
+                or f.get("to_task_id")
+                or f.get("to_task")
+                or f.get("to_name")
+            )
+            cond = str(f.get("condition") or "").strip()
+            if not src or not tgt or src == tgt:
+                continue
+            k = (src, tgt, cond)
+            if k in seen_seq:
+                continue
+            seen_seq.add(k)
+            seqs.append(
+                {
+                    "elementType": "Sequence",
+                    "id": f"seq_{src}_{tgt}",
+                    "name": cond or "",
+                    "source": src,
+                    "target": tgt,
+                    "condition": cond,
+                }
+            )
+
+        # fallback linear chain when explicit flows are insufficient
+        node_chain: List[str] = [start_id]
+        node_chain.extend([str(a.get("id")) for a in activity_rows if str(a.get("id") or "")])
+        node_chain.extend([str(g.get("id")) for g in gateway_rows if str(g.get("id") or "")])
+        node_chain.append(end_id)
+        if len(seqs) <= 1:
+            for i in range(len(node_chain) - 1):
+                src = node_chain[i]
+                tgt = node_chain[i + 1]
+                if not src or not tgt or src == tgt:
+                    continue
+                k = (src, tgt, "")
+                if k in seen_seq:
+                    continue
+                seen_seq.add(k)
+                seqs.append(
+                    {
+                        "elementType": "Sequence",
+                        "id": f"seq_{src}_{tgt}",
+                        "name": "",
+                        "source": src,
+                        "target": tgt,
+                        "condition": "",
+                    }
+                )
+
+        elements.extend(seqs)
+        return {
+            "processDefinitionId": str(uuid.uuid4()),
+            "processDefinitionName": process_name,
+            "description": f"{process_name} (extracted fallback)",
+            "isHorizontal": True,
+            "data": [],
+            "roles": role_rows,
+            "elements": elements,
+            "subProcesses": [],
+            "participants": [],
+            "generated_from": "extracted_fallback",
+        }
+
+    def _enrich_tasks_with_role_from_graph(
+        self,
+        *,
+        detail: Dict[str, Any],
+        graph_elements: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Neo4j graph snapshot(PERFORMED_BY edge)로 task.role_name/role을 보강.
+        get_process_with_details()의 task row에는 역할명이 직접 들어있지 않아
+        deterministic procdef에서 모든 task가 default role로 뭉개지는 문제를 방지한다.
+        """
+        out = dict(detail or {})
+        tasks = out.get("tasks") or []
+        roles = out.get("roles") or []
+        elements = (graph_elements or {}).get("elements") or []
+        if not isinstance(tasks, list) or not tasks:
+            return out
+
+        role_id_to_name: Dict[str, str] = {}
+        for r in roles:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("role_id") or r.get("id") or "").strip()
+            rname = str(r.get("name") or r.get("role") or "").strip()
+            if rid and rname:
+                role_id_to_name[rid] = rname
+
+        task_id_to_role_name: Dict[str, str] = {}
+        task_id_to_desc: Dict[str, str] = {}
+        task_id_to_instruction: Dict[str, str] = {}
+        instruction_node_text_by_node_id: Dict[str, str] = {}
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            data = el.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            etype = str(data.get("type") or "").strip()
+            if etype == "PERFORMED_BY":
+                src = str(data.get("source") or "").strip()  # Task:<task_id>
+                tgt = str(data.get("target") or "").strip()  # Role:<role_id>
+                if src.startswith("Task:") and tgt.startswith("Role:"):
+                    task_id = src.split("Task:", 1)[1].strip()
+                    role_id = tgt.split("Role:", 1)[1].strip()
+                    role_name = role_id_to_name.get(role_id)
+                    if task_id and role_name:
+                        task_id_to_role_name[task_id] = role_name
+                continue
+
+            # Task node payload may include description/instruction
+            if etype == "Task":
+                task_id = str(data.get("task_id") or "").strip()
+                if task_id:
+                    desc = str(data.get("description") or "").strip()
+                    inst = str(data.get("instruction") or "").strip()
+                    if desc:
+                        task_id_to_desc[task_id] = desc
+                    if inst:
+                        task_id_to_instruction[task_id] = inst
+                continue
+
+            # Instruction node payload is separated in graph snapshot
+            if etype == "Instruction":
+                task_id = str(data.get("task_id") or "").strip()
+                inst = str(data.get("instruction") or "").strip()
+                node_id = str(data.get("id") or "").strip()
+                if not inst:
+                    inst = str(data.get("label") or "").strip()
+                if node_id and inst:
+                    instruction_node_text_by_node_id[node_id] = inst
+                if task_id and inst:
+                    task_id_to_instruction[task_id] = inst
+                continue
+
+            # Some snapshots only provide HAS_INSTRUCTION edge + Instruction node.
+            if etype == "HAS_INSTRUCTION":
+                src = str(data.get("source") or "").strip()  # Task:<task_id>
+                tgt = str(data.get("target") or "").strip()  # Instruction:<task_id>:instruction
+                if src.startswith("Task:") and tgt:
+                    task_id = src.split("Task:", 1)[1].strip()
+                    inst = instruction_node_text_by_node_id.get(tgt) or ""
+                    if task_id and inst and task_id not in task_id_to_instruction:
+                        task_id_to_instruction[task_id] = inst
+
+        if not task_id_to_role_name and not task_id_to_desc and not task_id_to_instruction:
+            return out
+
+        role_changed = 0
+        text_changed = 0
+        patched_tasks: List[Dict[str, Any]] = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                patched_tasks.append(t)
+                continue
+            tid = str(t.get("task_id") or t.get("id") or "").strip()
+            if tid:
+                role_name = task_id_to_role_name.get(tid)
+                if role_name:
+                    if str(t.get("role_name") or "").strip() != role_name:
+                        t["role_name"] = role_name
+                        role_changed += 1
+                    if str(t.get("role") or "").strip() != role_name:
+                        t["role"] = role_name
+
+                # Fill only when missing
+                if not str(t.get("description") or "").strip():
+                    desc = task_id_to_desc.get(tid) or ""
+                    if desc:
+                        t["description"] = desc
+                        text_changed += 1
+                if not str(t.get("instruction") or "").strip():
+                    inst = task_id_to_instruction.get(tid) or ""
+                    if inst:
+                        t["instruction"] = inst
+                        text_changed += 1
+            patched_tasks.append(t)
+
+        if role_changed > 0 or text_changed > 0:
+            logger.info(
+                f"[EXTRACT][TASK-ENRICH] from graph edges/nodes: role_changed={role_changed} text_changed={text_changed} "
+                f"task_role_pairs={len(task_id_to_role_name)}"
+            )
+        out["tasks"] = patched_tasks
+        return out
+
+    def _backfill_activity_content_from_extracted(
+        self,
+        *,
+        runtime_def: Dict[str, Any],
+        extracted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Deterministic post-fix for generated JSON:
+        - Do NOT add new activities.
+        - For existing activities, fill missing role/description/instruction
+          from extracted tasks by (id or normalized name).
+        """
+        out = dict(runtime_def or {})
+        acts = out.get("activities") or []
+        if not isinstance(acts, list) or not acts:
+            return out
+
+        ex_tasks = extracted.get("tasks") or extracted.get("activities") or []
+        if not isinstance(ex_tasks, list) or not ex_tasks:
+            return out
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+        by_name: Dict[str, Dict[str, Any]] = {}
+        ex_rows: List[Dict[str, Any]] = []
+        for t in ex_tasks:
+            if not isinstance(t, dict):
+                continue
+            ex_rows.append(t)
+            tid = str(t.get("task_id") or t.get("id") or "").strip()
+            tname = str(t.get("name") or "").strip()
+            if tid:
+                by_id[tid] = t
+            if tname:
+                by_name[self._normalize_text_key(tname)] = t
+
+        # deterministic fallback by order when id/name mapping fails
+        ex_rows_sorted = sorted(
+            ex_rows,
+            key=lambda x: (
+                10**9 if x.get("order") is None else int(x.get("order") or 0),
+                str(x.get("name") or ""),
+            ),
+        )
+
+        changed = 0
+        for idx, a in enumerate(acts):
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            aname = str(a.get("name") or "").strip()
+            src = by_id.get(aid) or by_name.get(self._normalize_text_key(aname))
+            if not src and aname:
+                anorm = self._normalize_text_key(aname)
+                for row in ex_rows_sorted:
+                    rn = self._normalize_text_key(str(row.get("name") or ""))
+                    if rn and (rn in anorm or anorm in rn):
+                        src = row
+                        break
+            if not src and idx < len(ex_rows_sorted):
+                src = ex_rows_sorted[idx]
+            if not src:
+                continue
+
+            src_role = str(src.get("performer_role") or src.get("role") or src.get("role_name") or "").strip()
+            src_desc = str(src.get("description") or "").strip()
+            src_inst = str(src.get("instruction") or "").strip()
+
+            if src_role and not str(a.get("role") or "").strip():
+                a["role"] = src_role
+                changed += 1
+            if src_desc and not str(a.get("description") or "").strip():
+                a["description"] = src_desc
+                changed += 1
+            if src_inst and not str(a.get("instruction") or "").strip():
+                a["instruction"] = src_inst
+                changed += 1
+
+        if changed > 0:
+            logger.info(f"[PROCDEF][BACKFILL] filled missing activity fields from extracted: changed={changed}")
+        out["activities"] = acts
+        return out
+
+    def _augment_runtime_with_gateway_dmn(
+        self,
+        *,
+        runtime_def: Dict[str, Any],
+        extracted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Gateway 분기 조건을 검증 가능한 형태로 남기기 위해 DMN 메타를 보강합니다.
+        - dmn_decisions: gateway별 의사결정 단위
+        - dmn_rules: sequence condition별 true/false(또는 다중 분기) 규칙
+        """
+        out = dict(runtime_def or {})
+        gateways = out.get("gateways") or []
+        sequences = out.get("sequences") or []
+        activities = out.get("activities") or []
+        events = out.get("events") or []
+
+        if not isinstance(gateways, list) or not isinstance(sequences, list):
+            return out
+
+        existing_decisions = out.get("dmn_decisions") if isinstance(out.get("dmn_decisions"), list) else []
+        existing_rules = out.get("dmn_rules") if isinstance(out.get("dmn_rules"), list) else []
+
+        # Keep extracted decisions/rules as base when available.
+        ex_decisions = extracted.get("decisions") if isinstance(extracted.get("decisions"), list) else []
+        ex_rules = extracted.get("rules") if isinstance(extracted.get("rules"), list) else []
+
+        decisions_out: List[Dict[str, Any]] = []
+        rules_out: List[Dict[str, Any]] = []
+        seen_decision_ids: Set[str] = set()
+        seen_rule_ids: Set[str] = set()
+
+        def _append_decision(d: Dict[str, Any]):
+            did = str(d.get("decision_id") or d.get("id") or "").strip()
+            if not did:
+                return
+            if did in seen_decision_ids:
+                return
+            seen_decision_ids.add(did)
+            decisions_out.append(d)
+
+        def _append_rule(r: Dict[str, Any]):
+            rid = str(r.get("rule_id") or r.get("id") or "").strip()
+            if not rid:
+                return
+            if rid in seen_rule_ids:
+                return
+            seen_rule_ids.add(rid)
+            rules_out.append(r)
+
+        for d in (existing_decisions + ex_decisions):
+            if isinstance(d, dict):
+                did = str(d.get("decision_id") or d.get("id") or "").strip()
+                if not did:
+                    did = f"dmn_decision_{uuid.uuid4().hex[:8]}"
+                    d = {**d, "decision_id": did}
+                _append_decision(d)
+        for r in (existing_rules + ex_rules):
+            if isinstance(r, dict):
+                rid = str(r.get("rule_id") or r.get("id") or "").strip()
+                if not rid:
+                    rid = f"dmn_rule_{uuid.uuid4().hex[:8]}"
+                    r = {**r, "rule_id": rid}
+                _append_rule(r)
+
+        node_name_by_id: Dict[str, str] = {}
+        for coll in (activities, events, gateways):
+            if not isinstance(coll, list):
+                continue
+            for n in coll:
+                if isinstance(n, dict):
+                    nid = str(n.get("id") or "").strip()
+                    if nid:
+                        node_name_by_id[nid] = str(n.get("name") or "").strip()
+
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for s in sequences:
+            if not isinstance(s, dict):
+                continue
+            src = str(s.get("source") or "").strip()
+            if src:
+                outgoing_by_source.setdefault(src, []).append(s)
+
+        added_decisions = 0
+        added_rules = 0
+        for gw in gateways:
+            if not isinstance(gw, dict):
+                continue
+            gid = str(gw.get("id") or "").strip()
+            gtype = str(gw.get("type") or "").lower().strip()
+            if not gid or "exclusive" not in gtype:
+                continue
+            outs = outgoing_by_source.get(gid) or []
+            if len(outs) < 2:
+                continue
+
+            gname = str(gw.get("name") or "").strip()
+            gdesc = str(gw.get("description") or "").strip()
+            decision_id = f"dmn_decision_{self._snake_id(gid) or gid}"
+            decision = {
+                "decision_id": decision_id,
+                "name": gname or "분기 의사결정",
+                "description": gdesc or f"{gname or gid}에 대한 분기 판단",
+                "related_gateway_id": gid,
+            }
+            if decision_id not in seen_decision_ids:
+                _append_decision(decision)
+                added_decisions += 1
+
+            for idx, s in enumerate(outs, start=1):
+                cond = str(s.get("condition") or "").strip()
+                if not cond:
+                    continue
+                target = str(s.get("target") or "").strip()
+                target_name = node_name_by_id.get(target) or target
+                rule_id = f"dmn_rule_{self._snake_id(gid) or gid}_{idx}"
+                rule = {
+                    "rule_id": rule_id,
+                    "decision_id": decision_id,
+                    "decision_name": decision.get("name"),
+                    "when": cond,
+                    "then": f"{target_name} 경로 선택",
+                    "condition": cond,
+                    "target": target,
+                }
+                if rule_id not in seen_rule_ids:
+                    _append_rule(rule)
+                    added_rules += 1
+
+        if added_decisions > 0 or added_rules > 0:
+            logger.info(
+                f"[PROCDEF][DMN] gateway-derived dmn added: decisions={added_decisions} rules={added_rules}"
+            )
+
+        out["dmn_decisions"] = decisions_out
+        out["dmn_rules"] = rules_out
+        return out
+
+    def _apply_extracted_roles_to_runtime_definition(
+        self,
+        *,
+        runtime_def: Dict[str, Any],
+        extracted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        If runtime_def roles collapse into one role, remap activity roles using extracted data.
+        Priority:
+        1) extracted.task_role_mappings
+        2) extracted.tasks[].(performer_role|role|role_name)
+        """
+        out = dict(runtime_def or {})
+        acts = out.get("activities") or []
+        roles = out.get("roles") or []
+        if not isinstance(acts, list) or not acts:
+            return out
+
+        # role pool from extracted
+        role_pool: List[str] = []
+        for r in (extracted.get("roles") or []):
+            if isinstance(r, dict):
+                rn = str(r.get("name") or r.get("role") or "").strip()
+                if rn and rn not in role_pool:
+                    role_pool.append(rn)
+
+        # Build task->role map from explicit mappings
+        task_role_map: Dict[str, str] = {}
+        for m in (extracted.get("task_role_mappings") or []):
+            if not isinstance(m, dict):
+                continue
+            tname = str(m.get("task_name") or m.get("task") or m.get("name") or "").strip()
+            rname = str(m.get("role_name") or m.get("role") or m.get("performer_role") or "").strip()
+            if tname and rname:
+                task_role_map[self._normalize_text_key(tname)] = rname
+                if rname not in role_pool:
+                    role_pool.append(rname)
+
+        # Build task->role map from tasks
+        extracted_tasks = extracted.get("tasks") or extracted.get("activities") or []
+        if isinstance(extracted_tasks, list):
+            for t in extracted_tasks:
+                if not isinstance(t, dict):
+                    continue
+                tname = str(t.get("name") or "").strip()
+                rname = str(t.get("performer_role") or t.get("role") or t.get("role_name") or "").strip()
+                if tname and rname:
+                    task_role_map.setdefault(self._normalize_text_key(tname), rname)
+                    if rname not in role_pool:
+                        role_pool.append(rname)
+
+        if not task_role_map:
+            return out
+
+        # remap activities
+        changed = 0
+        for a in acts:
+            if not isinstance(a, dict):
+                continue
+            key = self._normalize_text_key(a.get("name"))
+            mapped = task_role_map.get(key)
+            if mapped:
+                if str(a.get("role") or "").strip() != mapped:
+                    a["role"] = mapped
+                    changed += 1
+
+        if changed > 0 and role_pool:
+            # Keep role rows aligned with activity roles used after remap.
+            used_roles = []
+            for a in acts:
+                rn = str((a or {}).get("role") or "").strip()
+                if rn and rn not in used_roles:
+                    used_roles.append(rn)
+            if used_roles:
+                out["roles"] = [
+                    {
+                        "name": rn,
+                        "endpoint": f"role_{self._snake_id(rn) or 'owner'}",
+                        "resolutionRule": "",
+                        "origin": "created",
+                    }
+                    for rn in used_roles
+                ]
+            logger.info(f"[PROCDEF][ROLE-REMAP] remapped roles from extracted: changed={changed} used_roles={len(out.get('roles') or [])}")
+
+        out["activities"] = acts
+        return out
 
     def _validate_and_normalize_elements_model(
         self,
@@ -2961,9 +3852,88 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             )
             seq_pairs.add((s, t))
 
+        # Gateway branching: enforce explicit Gateway nodes for any branching point.
+        # If a non-gateway node has multiple outgoing flows, insert an ExclusiveGateway and reroute.
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for s in seqs:
+            outgoing_by_source.setdefault(str(s.get("source")), []).append(s)
+        element_by_id_for_branching: Dict[str, Dict[str, Any]] = {
+            str(e.get("id")): e for e in elems if isinstance(e, dict) and e.get("id")
+        }
+
+        for src_id, outs in list(outgoing_by_source.items()):
+            if len(outs) <= 1:
+                continue
+            src_el = element_by_id_for_branching.get(src_id) or {}
+            if str(src_el.get("elementType") or "") == "Gateway":
+                continue
+
+            src_name = str(src_el.get("name") or "").strip()
+            src_desc = str(src_el.get("description") or "").strip()
+            gw_base = self._snake_id(f"{src_id}_gateway") or f"gateway_{uuid.uuid4().hex[:6]}"
+            gw_id = gw_base
+            suffix = 1
+            while any(str(e.get("id")) == gw_id for e in elems):
+                suffix += 1
+                gw_id = f"{gw_base}_{suffix}"
+
+            gw_name = self._derive_gateway_name(
+                raw_name=f"{src_name or src_id} 분기",
+                description=(src_desc or f"{src_name or src_id} 여부 판단"),
+                idx=1,
+            )
+            gw_role = str(src_el.get("role") or "").strip()
+            gw_element = {
+                "elementType": "Gateway",
+                "id": gw_id,
+                "name": gw_name,
+                "role": gw_role,
+                "source": src_id,
+                "type": "ExclusiveGateway",
+                "description": (src_desc or f"{src_name or src_id} 분기 판단"),
+            }
+            elems.append(gw_element)
+            element_by_id_for_branching[gw_id] = gw_element
+
+            # Remove original src->* branch edges, then add src->gateway and gateway->* edges.
+            original_out_targets = []
+            remaining_seqs: List[Dict[str, Any]] = []
+            for s in seqs:
+                if str(s.get("source")) == src_id:
+                    original_out_targets.append(dict(s))
+                    continue
+                remaining_seqs.append(s)
+            seqs = remaining_seqs
+
+            seqs.append(
+                {
+                    "elementType": "Sequence",
+                    "id": f"seq_{src_id}_{gw_id}",
+                    "name": "",
+                    "source": src_id,
+                    "target": gw_id,
+                    "condition": "",
+                }
+            )
+            for s in original_out_targets:
+                tgt = str(s.get("target") or "").strip()
+                if not tgt or tgt == gw_id:
+                    continue
+                cond = str(s.get("condition") or "").strip()
+                seqs.append(
+                    {
+                        "elementType": "Sequence",
+                        "id": f"seq_{gw_id}_{tgt}",
+                        "name": cond,
+                        "source": gw_id,
+                        "target": tgt,
+                        "condition": cond,
+                    }
+                )
+
         # Gateway branching: ensure conditions exist when a gateway has multiple outgoing.
         # Also: remove degenerate gateways (<=1 outgoing) by collapsing them into straight sequences.
-        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        outgoing_by_source = {}
         incoming_by_target: Dict[str, List[Dict[str, Any]]] = {}
         for s in seqs:
             outgoing_by_source.setdefault(str(s.get("source")), []).append(s)
@@ -3018,10 +3988,52 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             outs = outgoing_by_source.get(gid) or []
             if len(outs) <= 1:
                 continue
+            element_by_id: Dict[str, Dict[str, Any]] = {
+                str(e.get("id")): e for e in elems if isinstance(e, dict) and e.get("id")
+            }
+            gw_el = element_by_id.get(gid) or {}
+            gw_name = str(gw_el.get("name") or "").strip()
+            gw_desc = str(gw_el.get("description") or "").strip()
+            if self._is_placeholder_gateway_name(gw_name):
+                gw_el["name"] = self._derive_gateway_name(raw_name=gw_name, description=gw_desc, idx=1)
+                gw_name = str(gw_el.get("name") or "").strip()
+
+            def _make_gateway_condition(seq: Dict[str, Any], idx: int) -> str:
+                tgt_id = str(seq.get("target") or "").strip()
+                tgt = element_by_id.get(tgt_id) or {}
+                tgt_name = str(tgt.get("name") or "").strip()
+                tgt_desc = str(tgt.get("description") or "").strip()
+                hint = tgt_name or tgt_desc
+                if hint:
+                    hint = re.sub(r"\s+", " ", hint).strip()
+                    if len(hint) > 60:
+                        hint = hint[:60].rstrip() + "..."
+                    # relation label/시스템 엣지명 등 비즈니스 조건이 아닌 문자열은 제거
+                    bad = {"has task", "has instruction", "performed_by", "has gateway", "has event"}
+                    if self._normalize_text_key(hint) in {self._normalize_text_key(x) for x in bad}:
+                        hint = ""
+                if hint:
+                    return f"{hint}인 경우"
+                return f"{gw_name or '해당 조건'} 충족인 경우"
+
             for j, s in enumerate(outs, start=1):
                 cond = str(s.get("condition") or "").strip()
+                cond_low = self._normalize_text_key(cond)
+                if cond_low in {"hastask", "hasinstruction", "performedby", "hasgateway", "hasevent"}:
+                    cond = ""
+                if re.match(r"^(조건|분기|case)\d+$", cond_low):
+                    cond = ""
                 if not cond:
-                    s["condition"] = f"조건 {j}"
+                    if len(outs) == 2:
+                        c_true, c_false = self._derive_true_false_conditions(
+                            gateway_name=gw_name,
+                            gateway_description=gw_desc,
+                        )
+                        s["condition"] = c_true if j == 1 else c_false
+                    else:
+                        s["condition"] = _make_gateway_condition(s, j)
+                if not str(s.get("name") or "").strip():
+                    s["name"] = str(s.get("condition") or "").strip()
 
         # Merge normalized elements list: keep non-seq + normalized seqs at end (stable parsing)
         non_seq = [e for e in elems if e.get("elementType") != "Sequence"]
@@ -3216,9 +4228,6 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         - BPMN XML은 폼 생성/참조정보(inputData) 확장 이후에 최종값으로 생성/저장해야 합니다.
           (초기 생성 후 확장 단계에서 tool/form id 등이 변경되므로, XML을 먼저 만들면 stale 됩니다.)
         """
-        if not self.openai_client:
-            return None
-
         # --- Diagnostics: extracted input summary (direct cause for empty elements) ---
         try:
             ex_tasks = extracted.get("tasks") or extracted.get("activities") or []
@@ -3246,14 +4255,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         except Exception:
             pass
 
-        # 1) (프롬프트 개선) ProcessConsultingGenerator 프롬프트로 "말로 된 프로세스 초안"을 먼저 생성
-        # NOTE: 담당자 매핑은 "마지막 확장 단계(after forms)"에서 수행한다.
-        consulting_outline = await self._generate_process_outline_via_consulting_prompt(
-            process_name=process_name,
-            user_request=user_request,
-            extracted=extracted,
-            hints_simplified={},
-        )
+        # 1) 컨설팅 단계 우회:
+        #    추출 정보 + 생성 규칙만으로 바로 ProcessDefinition 생성
+        consulting_outline = None
+        logger.info(f"[PROCDEF][CONSULTING] skipped (direct generation from extracted, process={process_name!r})")
 
         # 2) Build prompt inputs for create-only process definition generation
         # NOTE:
@@ -3270,22 +4275,60 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             extracted_summary=extracted_summary,
             user_request=user_request,
         )
-
-        elements_model = await self._call_openai_process_definition(messages=messages)
-        if not isinstance(elements_model, dict):
-            logger.warning(f"[PROCDEF][LLM] elements_model is not dict -> generation failed (process={process_name!r})")
-            return None
-
-        # LLM raw shape summary
-        try:
-            elems = elements_model.get("elements")
-            elems_len = len(elems) if isinstance(elems, list) else None
-            logger.info(
-                f"[PROCDEF][LLM] elements_model received: keys={list(elements_model.keys())} elements_len={elems_len} "
-                f"(process={process_name!r})"
+        # 3) Build elements model:
+        # - deterministic mode: always from extracted
+        # - llm mode: llm first, fallback to extracted when degraded
+        if not self._use_llm_procdef_enrich:
+            logger.info(f"[PROCDEF][MODE] deterministic (USE_LLM_PROCDEF_ENRICH=false, process={process_name!r})")
+            elements_model = self._build_elements_model_from_extracted(
+                process_name=process_name,
+                extracted=extracted,
             )
-        except Exception:
-            pass
+        else:
+            if not self.openai_client:
+                logger.warning(f"[PROCDEF][LLM] openai_client unavailable; fallback to deterministic (process={process_name!r})")
+                elements_model = self._build_elements_model_from_extracted(
+                    process_name=process_name,
+                    extracted=extracted,
+                )
+            else:
+                elements_model = await self._call_openai_process_definition(messages=messages)
+                if not isinstance(elements_model, dict):
+                    logger.warning(f"[PROCDEF][LLM] elements_model is not dict -> fallback deterministic (process={process_name!r})")
+                    elements_model = self._build_elements_model_from_extracted(
+                        process_name=process_name,
+                        extracted=extracted,
+                    )
+                else:
+                    # LLM raw shape summary
+                    try:
+                        elems = elements_model.get("elements")
+                        elems_len = len(elems) if isinstance(elems, list) else None
+                        logger.info(
+                            f"[PROCDEF][LLM] elements_model received: keys={list(elements_model.keys())} elements_len={elems_len} "
+                            f"(process={process_name!r})"
+                        )
+                    except Exception:
+                        pass
+
+                    # LLM이 스키마를 지키지 못해 extracted 대비 내용이 크게 줄어든 경우 강제 폴백
+                    try:
+                        use_fallback, reason = self._should_fallback_to_extracted_elements(
+                            elements_model=elements_model,
+                            extracted=extracted,
+                            process_name=process_name,
+                        )
+                        if use_fallback:
+                            logger.warning(
+                                f"[PROCDEF][FALLBACK] using extracted-based elements "
+                                f"(process={process_name!r}, reason={reason}, llm_keys={list(elements_model.keys())})"
+                            )
+                            elements_model = self._build_elements_model_from_extracted(
+                                process_name=process_name,
+                                extracted=extracted,
+                            )
+                    except Exception as e:
+                        logger.exception(f"[PROCDEF][FALLBACK] fallback decision/build failed: {type(e).__name__}: {e}")
 
         # 5) Strict validate/normalize elements model (connectivity + ids + required fields)
         elements_model = self._validate_and_normalize_elements_model(elements_model, process_name=process_name)
@@ -3300,10 +4343,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         # 6) Convert to runtime definition + enrich + assignment(again, as safety)
         runtime_def = self._elements_model_to_runtime_definition(elements_model)
+        # extracted 기준 역할 보정(역할이 하나로 뭉개지는 현상 완화)
+        runtime_def = self._apply_extracted_roles_to_runtime_definition(
+            runtime_def=runtime_def,
+            extracted=extracted,
+        )
         runtime_def = self._enrich_process_definition(
             runtime_def,
             process_name=str(runtime_def.get("processDefinitionName") or process_name),
             process_definition_id=str(elements_model.get("processDefinitionId") or runtime_def.get("processDefinitionId")),
+        )
+        runtime_def = self._backfill_activity_content_from_extracted(
+            runtime_def=runtime_def,
+            extracted=extracted,
+        )
+        runtime_def = self._ensure_end_event_connectivity(
+            runtime_def,
+            process_name=process_name,
         )
 
         # runtime_def summary (this will show when activities are empty -> start/end-only)
@@ -3825,9 +4881,37 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         )
         if not isinstance(obj, dict):
             return None
-        if not isinstance(obj.get("decisions"), list):
+        # Parse recovery: model may wrap decisions inside data/result/plan or output partial shapes.
+        decisions = obj.get("decisions")
+        if not isinstance(decisions, list):
+            for k in ("data", "result", "plan", "output"):
+                nested = obj.get(k)
+                if isinstance(nested, dict) and isinstance(nested.get("decisions"), list):
+                    decisions = nested.get("decisions")
+                    break
+        if not isinstance(decisions, list):
             return None
-        return obj
+
+        normalized_decisions: List[Dict[str, Any]] = []
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            nd = dict(d)
+            # accept alternate keys from imperfect outputs
+            if not str(nd.get("activity_id") or "").strip():
+                nd["activity_id"] = (
+                    nd.get("activityId")
+                    or nd.get("task_id")
+                    or nd.get("taskId")
+                    or ""
+                )
+            if not str(nd.get("action") or "").strip():
+                nd["action"] = "none"
+            normalized_decisions.append(nd)
+
+        if not normalized_decisions:
+            return None
+        return {"decisions": normalized_decisions}
 
     async def _llm_generate_agent_profile(
         self,
@@ -4096,16 +5180,31 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             return bool(u and u.get("is_agent") is True and u.get("id"))
 
         default_agent_mode = "draft"  # fixed
+        unresolved_activity_ids: Optional[Set[str]] = None
 
         if isinstance(plan, dict) and isinstance(plan.get("decisions"), list):
             decisions = plan.get("decisions") or []
             by_aid: Dict[str, Dict[str, Any]] = {}
+            activity_name_to_id: Dict[str, str] = {}
+            for a in activities:
+                if isinstance(a, dict):
+                    aid0 = _clean_text(a.get("id"))
+                    aname0 = self._normalize_text_key(_clean_text(a.get("name")))
+                    if aid0 and aname0:
+                        activity_name_to_id[aname0] = aid0
             for d in decisions:
                 if isinstance(d, dict):
                     aid = str(d.get("activity_id") or "").strip()
+                    if not aid:
+                        dname = self._normalize_text_key(
+                            str(d.get("activity_name") or d.get("task_name") or d.get("name") or "")
+                        )
+                        aid = activity_name_to_id.get(dname, "")
                     if aid:
+                        d["activity_id"] = aid
                         by_aid[aid] = d
 
+            plan_handled_ids: Set[str] = set()
             for a in activities:
                 if not isinstance(a, dict):
                     continue
@@ -4117,6 +5216,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if not isinstance(d, dict):
                     # no decision => leave unassigned (fallback later)
                     continue
+                plan_handled_ids.add(aid)
 
                 action = str(d.get("action") or "none").strip()
                 conf = d.get("confidence")
@@ -4181,8 +5281,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> none conf={conf} reason={reason!r}"
                 )
 
-            proc_json["activities"] = activities
-            return
+            all_activity_ids = {
+                _clean_text(a.get("id"))
+                for a in activities
+                if isinstance(a, dict) and _clean_text(a.get("id"))
+            }
+            if all_activity_ids and plan_handled_ids >= all_activity_ids:
+                proc_json["activities"] = activities
+                return
+            unresolved_activity_ids = all_activity_ids - plan_handled_ids
+            logger.warning(
+                f"[ASSIGN][PLAN] partial plan coverage: handled={len(plan_handled_ids)} total={len(all_activity_ids)} -> fallback per-activity"
+            )
 
         # -------------------------------------------------------------------
         # Fallback (legacy): per-activity heuristics + LLM
@@ -4264,10 +5374,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             return None
 
         default_agent_mode = "draft"  # fixed
+        assign_llm_concurrency = max(1, int(os.getenv("ASSIGN_LLM_CONCURRENCY", "4")))
+        rec_targets: List[Dict[str, Any]] = []
+
+        # 1) Fast-path (already assigned / heuristic) and collect LLM recommend jobs
         for a in activities:
             if not isinstance(a, dict):
                 continue
             aid = _clean_text(a.get("id"))
+            if unresolved_activity_ids is not None and aid and aid not in unresolved_activity_ids:
+                continue
             aname = _clean_text(a.get("name"))
             rn = _clean_text(a.get("role"))
 
@@ -4278,60 +5394,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 continue
 
             human_required = _looks_strongly_human_required(a)
-            # human_required: 신규 생성은 금지하되, 기존에 조직도/users에 있는 적절한 에이전트는 찾아서 매핑할 수 있어야 한다.
-            if human_required:
-                hit = _heuristic_pick_agent(a, allow_on_human_required=True)
-                if hit and hit.get("id"):
-                    a["agent"] = hit.get("id")
-                    a["agentMode"] = default_agent_mode
-                    a["orchestration"] = "crewai-action"
-                    logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent(human_required) id={hit.get('id')}")
-                    continue
-                # LLM may still find a better existing agent, but MUST NOT create a new one for human_required tasks.
-                activity_ctx = [
-                    {
-                        "activityId": aid,
-                        "activityName": aname,
-                        "role": rn,
-                        "instruction": _clean_text(a.get("instruction")),
-                        "description": _clean_text(a.get("description")),
-                        "tool": _clean_text(a.get("tool")),
-                    }
-                ]
-                role_query = _clean_text(f"{rn} {aname} {a.get('instruction') or ''} {a.get('description') or ''}") or aid
-                rec = await self._llm_recommend_assignee(
-                    tenant_id=tenant_id,
-                    process_name=process_name,
-                    role_name=role_query,
-                    activities_context=activity_ctx,
-                    extracted_context=extracted,
-                    allow_create_agent=False,
-                )
-                if isinstance(rec, dict) and str(rec.get("action") or "") == "existing_user":
-                    target_user_id = str(rec.get("target_user_id") or "").strip()
-                    if target_user_id and _is_agent_user_id(target_user_id):
-                        a["agent"] = target_user_id
-                        a["agentMode"] = default_agent_mode
-                        a["orchestration"] = "crewai-action"
-                        logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user(human_required) id={target_user_id}")
-                        continue
-                # default: keep unassigned (no creation)
-                a["agent"] = None
-                a["agentMode"] = "none"
-                a["orchestration"] = None
-                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> human_required => no agent (creation disabled)")
-                continue
-
-            # heuristic pick first
-            hit = _heuristic_pick_agent(a, allow_on_human_required=False)
+            hit = _heuristic_pick_agent(a, allow_on_human_required=human_required)
             if hit and hit.get("id"):
                 a["agent"] = hit.get("id")
                 a["agentMode"] = default_agent_mode
                 a["orchestration"] = "crewai-action"
-                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent id={hit.get('id')}")
+                logger.info(
+                    f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent{'(human_required)' if human_required else ''} id={hit.get('id')}"
+                )
                 continue
 
-            # LLM-based for this specific activity (more context than role-only)
             activity_ctx = [
                 {
                     "activityId": aid,
@@ -4342,17 +5414,56 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "tool": _clean_text(a.get("tool")),
                 }
             ]
-            # IMPORTANT: do not use role name only. Include activity name/instruction so that
-            # candidate filtering can find agents like "인터뷰 검증 에이전트".
             role_query = _clean_text(f"{rn} {aname} {a.get('instruction') or ''} {a.get('description') or ''}") or aid
-            rec = await self._llm_recommend_assignee(
-                tenant_id=tenant_id,
-                process_name=process_name,
-                role_name=role_query,
-                activities_context=activity_ctx,
-                extracted_context=extracted,
-                allow_create_agent=True,
+            rec_targets.append(
+                {
+                    "activity": a,
+                    "aid": aid,
+                    "aname": aname,
+                    "rn": rn,
+                    "activity_ctx": activity_ctx,
+                    "role_query": role_query,
+                    "allow_create_agent": (not human_required),
+                }
             )
+
+        # 2) Parallel recommend calls only (apply/create/save는 아래에서 순차)
+        sem = asyncio.Semaphore(assign_llm_concurrency)
+
+        async def _recommend_one(target: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                rec = await self._llm_recommend_assignee(
+                    tenant_id=tenant_id,
+                    process_name=process_name,
+                    role_name=target.get("role_query") or "",
+                    activities_context=target.get("activity_ctx") or [],
+                    extracted_context=extracted,
+                    allow_create_agent=bool(target.get("allow_create_agent")),
+                )
+            out = dict(target)
+            out["rec"] = rec
+            return out
+
+        rec_results: List[Dict[str, Any]] = []
+        if rec_targets:
+            raw_results = await asyncio.gather(*[asyncio.create_task(_recommend_one(t)) for t in rec_targets], return_exceptions=True)
+            for rr in raw_results:
+                if isinstance(rr, Exception):
+                    logger.warning(f"[ASSIGN] recommend call failed: {rr}")
+                    continue
+                rec_results.append(rr)
+
+        # 3) Apply recommendations sequentially (safe side-effects)
+        for item in rec_results:
+            a = item.get("activity") or {}
+            aid = str(item.get("aid") or "")
+            aname = str(item.get("aname") or "")
+            rn = str(item.get("rn") or "")
+            allow_create_agent = bool(item.get("allow_create_agent"))
+            rec = item.get("rec")
+
+            if not isinstance(a, dict):
+                continue
             if not isinstance(rec, dict):
                 a["agent"] = None
                 a["agentMode"] = "none"
@@ -4374,9 +5485,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     a["agent"] = target_user_id
                     a["agentMode"] = default_agent_mode
                     a["orchestration"] = "crewai-action"
+                    if not allow_create_agent:
+                        logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user(human_required) id={target_user_id}")
                     continue
 
-            if action == "create_agent":
+            if action == "create_agent" and allow_create_agent:
                 create_agent = rec.get("create_agent") or {}
                 if not isinstance(create_agent, dict):
                     create_agent = {}
@@ -4410,6 +5523,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             a["agent"] = None
             a["agentMode"] = "none"
             a["orchestration"] = None
+            if not allow_create_agent:
+                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> human_required => no agent (creation disabled)")
 
         proc_json["activities"] = activities
 
@@ -4619,6 +5734,155 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         return result
 
+    def _ensure_end_event_connectivity(
+        self,
+        proc_json: Dict[str, Any],
+        *,
+        process_name: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Ensure at least one sequence reaches each endEvent.
+        If missing, connect a terminal node (prefer last activity) -> endEvent.
+        Also mirrors the added edge into `elements` list when present.
+        """
+        result = dict(proc_json or {})
+        activities = result.get("activities") or []
+        gateways = result.get("gateways") or []
+        events = result.get("events") or []
+        sequences = result.get("sequences") or []
+        if not isinstance(activities, list):
+            activities = []
+        if not isinstance(gateways, list):
+            gateways = []
+        if not isinstance(events, list):
+            events = []
+        if not isinstance(sequences, list):
+            sequences = []
+
+        end_ids: List[str] = []
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("type") or "").strip().lower()
+            if et == "endevent":
+                eid = str(e.get("id") or "").strip()
+                if eid:
+                    end_ids.append(eid)
+        if not end_ids:
+            result["sequences"] = sequences
+            return result
+
+        node_ids: List[str] = []
+        for a in activities:
+            if isinstance(a, dict):
+                aid = str(a.get("id") or "").strip()
+                if aid:
+                    node_ids.append(aid)
+        for g in gateways:
+            if isinstance(g, dict):
+                gid = str(g.get("id") or "").strip()
+                if gid:
+                    node_ids.append(gid)
+        for e in events:
+            if isinstance(e, dict):
+                eid = str(e.get("id") or "").strip()
+                if eid:
+                    node_ids.append(eid)
+
+        outgoing: Set[str] = set()
+        incoming: Dict[str, int] = {}
+        pair_set: Set[Tuple[str, str]] = set()
+        for s in sequences:
+            if not isinstance(s, dict):
+                continue
+            src = str(s.get("source") or "").strip()
+            tgt = str(s.get("target") or "").strip()
+            if src:
+                outgoing.add(src)
+            if tgt:
+                incoming[tgt] = incoming.get(tgt, 0) + 1
+            if src and tgt:
+                pair_set.add((src, tgt))
+
+        terminal_ids: List[str] = [nid for nid in node_ids if nid not in outgoing and nid not in end_ids]
+        # Prefer last activity id that is terminal.
+        last_activity_id = ""
+        for a in reversed(activities):
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            if aid:
+                last_activity_id = aid
+                if aid in terminal_ids:
+                    break
+
+        added = 0
+        for end_id in end_ids:
+            if incoming.get(end_id, 0) > 0:
+                continue
+
+            source_id = ""
+            if last_activity_id and last_activity_id not in end_ids:
+                source_id = last_activity_id
+            elif terminal_ids:
+                source_id = terminal_ids[-1]
+            else:
+                candidates = [nid for nid in node_ids if nid not in end_ids]
+                source_id = candidates[-1] if candidates else ""
+
+            if not source_id or source_id == end_id:
+                continue
+            if (source_id, end_id) in pair_set:
+                continue
+
+            seq_id = f"seq_{self._snake_id(source_id)}_{self._snake_id(end_id)}"
+            sequences.append(
+                {
+                    "id": seq_id,
+                    "name": "",
+                    "source": source_id,
+                    "target": end_id,
+                    "condition": "",
+                    "properties": "{}",
+                }
+            )
+            pair_set.add((source_id, end_id))
+            incoming[end_id] = incoming.get(end_id, 0) + 1
+            added += 1
+
+            # If elements list exists, mirror sequence there too.
+            elems = result.get("elements")
+            if isinstance(elems, list):
+                e_pair_set: Set[Tuple[str, str]] = set()
+                for el in elems:
+                    if not isinstance(el, dict):
+                        continue
+                    if str(el.get("elementType") or "").strip().lower() != "sequence":
+                        continue
+                    es = str(el.get("source") or "").strip()
+                    et = str(el.get("target") or "").strip()
+                    if es and et:
+                        e_pair_set.add((es, et))
+                if (source_id, end_id) not in e_pair_set:
+                    elems.append(
+                        {
+                            "id": seq_id,
+                            "name": "",
+                            "source": source_id,
+                            "target": end_id,
+                            "elementType": "Sequence",
+                        }
+                    )
+                    result["elements"] = elems
+
+        result["sequences"] = sequences
+        if added > 0:
+            logger.info(
+                f"[PROCDEF][CONNECTIVITY] appended terminal->end sequences: added={added} "
+                f"(process={process_name!r})"
+            )
+        return result
+
     def _convert_xml_to_json(self, bpmn_xml: str) -> Dict[str, Any]:
         """
         BPMN XML을 ProcessGPT JSON 형식으로 변환
@@ -4789,7 +6053,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         try:
             logger.info(f"[DB-PROC_DEF] ========== START ==========")
             logger.info(f"[DB-PROC_DEF] id={proc_def['id']}, tenant_id={tenant_id}")
-            logger.info(f"[DB-PROC_DEF] name={proc_def.get('name')}, bpmn_length={len(proc_def.get('bpmn', ''))}")
+            bpmn_val = proc_def.get("bpmn")
+            bpmn_len = len(bpmn_val) if isinstance(bpmn_val, str) else 0
+            logger.info(f"[DB-PROC_DEF] name={proc_def.get('name')}, bpmn_length={bpmn_len}")
             logger.info(f"[DB-PROC_DEF] definition keys: {list(proc_def.get('definition', {}).keys()) if proc_def.get('definition') else 'None'}")
             
             # 기존 proc_def 확인
@@ -5278,13 +6544,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "gateways": [],
                 "events": [],
                 "skills": [],
-                "dmn_decisions": [],
-                "dmn_rules": [],
                 "evidences": [],
-                "open_questions": [],
-                "resolved_questions": [],
-                "current_question": None,
-                "user_answer": None,
+                "agent_generation_policy": "existing_only",
                 "confidence_threshold": 0.8,
                 "current_step": "ingest_pdf",
                 "error": None,
@@ -5357,10 +6618,19 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
 
-                # Step 5: generate_skills
-                _enqueue_progress("[STEP] Agent Skill 문서 생성 중...", 74)
-                state.update(await asyncio.to_thread(workflow.generate_skills, state))
-                _enqueue_progress("[STEP] Agent Skill 문서 생성 완료", 80)
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 5: generate_skills (temporary skip supported)
+                if self._enable_skill_generation:
+                    _enqueue_progress("[STEP] Agent Skill 문서 생성 중...", 74)
+                    state.update(await asyncio.to_thread(workflow.generate_skills, state))
+                    _enqueue_progress("[STEP] Agent Skill 문서 생성 완료", 80)
+                else:
+                    # Keep workflow moving while bypassing skill generation/upload paths.
+                    state["skills"] = []
+                    state["skill_docs"] = {}
+                    _enqueue_progress("[STEP] Agent Skill 문서 생성 스킵", 80)
 
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
@@ -5433,6 +6703,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             if isinstance(flows, list):
                                 detail["sequence_flows"] = flows
                             graph_elements = await asyncio.to_thread(neo4j.get_process_graph_elements, proc_id)
+                            detail = self._enrich_tasks_with_role_from_graph(
+                                detail=detail,
+                                graph_elements=(graph_elements or {}),
+                            )
                             extracted_by_proc_id[proc_id] = {
                                 "detail": detail,
                                 "graph_elements": graph_elements or {},
@@ -5727,18 +7001,29 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
                 # legacy flow is intentionally removed
 
-                generated = await self._generate_processgpt_definition_and_bpmn(
-                    tenant_id=tenant_id,
-                    process_name=process_name,
-                    extracted=extracted_payload,
-                    user_request=user_input or "",
-                )
+                try:
+                    generated = await self._generate_processgpt_definition_and_bpmn(
+                        tenant_id=tenant_id,
+                        process_name=process_name,
+                        extracted=extracted_payload,
+                        user_request=(user_input or ""),
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"[PROCDEF][ERROR] process generation crashed; skipping process "
+                        f"(index={idx+1}/{total_bpmn}, process={process_name!r}): {type(e).__name__}: {e}"
+                    )
+                    continue
                 if not generated:
                     logger.warning(f"[WARN] ProcessGPT generation failed: {process_name}")
                     continue
 
                 elements_model = generated.get("elements_model") or {}
                 proc_json = generated.get("definition") or {}
+                proc_json = self._ensure_end_event_connectivity(
+                    proc_json,
+                    process_name=process_name,
+                )
 
                 # NEW: proc_def.definition에 "추출에 사용된 Neo4j proc_id"를 저장
                 # - 프론트에서 실제 Neo4j 그래프(노드/관계)를 조회할 때 사용
@@ -5782,8 +7067,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "id": proc_def_id,
                     "name": process_name,
                     "definition": proc_json,
-                    # BPMN XML은 "확장 완료 후" 최종본으로 생성/업데이트 한다.
-                    "bpmn": "",
+                    # 요청사항: XML 생성/저장 비활성화 -> bpmn은 null(None)로 저장
+                    "bpmn": None,
                     "uuid": str(uuid.uuid4()),
                     "type": "bpmn",
                     "owner": None,
@@ -5845,6 +7130,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                 task_id=task_id,
                                 job_id=job_id,
                             )
+                            proc_json = self._backfill_activity_content_from_extracted(
+                                runtime_def=proc_json,
+                                extracted=extracted_payload,
+                            )
+                            proc_json = self._ensure_end_event_connectivity(
+                                proc_json,
+                                process_name=process_name,
+                            )
                             # proc_json changed (inputData/agent fields), persist definition again
                             await self._update_proc_def_definition_only(
                                 proc_def_id=proc_def_id,
@@ -5864,38 +7157,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         logger.warning(f"[WARN] form generation/save stage failed unexpectedly: {e}")
 
                     # -----------------------------------------------------------------
-                    # FINAL: 확장 단계 이후 최종 elements_model로 BPMN XML 생성 + DB 반영
+                    # FINAL(XML disabled): 요청사항에 따라 BPMN XML 생성/저장 비활성화
                     # -----------------------------------------------------------------
-                    final_bpmn_xml = ""
-                    try:
-                        # runtime_def(proc_json) -> elements_model sync (tool/inputData/agent etc)
-                        final_elements_model = self._apply_runtime_definition_to_elements_model(
-                            elements_model=elements_model,
-                            runtime_def=proc_json,
-                        )
-                        final_bpmn_xml = await asyncio.to_thread(
-                            self._generate_bpmn_xml_backend,
-                            model=final_elements_model,
-                            horizontal=final_elements_model.get("isHorizontal"),
-                        )
-                    except Exception as e:
-                        logger.warning(f"[WARN] final BPMN XML generation failed: proc_def_id={proc_def_id} err={e}")
-
-                    if final_bpmn_xml:
-                        all_bpmn_xmls[proc_def_id] = final_bpmn_xml
-                        try:
-                            await self._update_proc_def_bpmn_only(proc_def_id=proc_def_id, tenant_id=tenant_id, bpmn_xml=final_bpmn_xml)
-                        except Exception as e:
-                            logger.warning(f"[WARN] proc_def.bpmn update failed after final xml: {e}")
-                    else:
-                        # keep empty bpmn; still allow completion
-                        all_bpmn_xmls.setdefault(proc_def_id, "")
+                    all_bpmn_xmls[proc_def_id] = None
                 
                 # saved_processes에 bpmn_xml 포함
                 saved_processes.append({
                     "id": proc_def_id,
                     "name": process_name,
-                    "bpmn_xml": all_bpmn_xmls.get(proc_def_id, "")  # 최종 XML(없으면 빈 문자열)
+                    "bpmn_xml": all_bpmn_xmls.get(proc_def_id)  # XML 생성 비활성화: None
                 })
 
                 # 스킬 매핑용: activity에 매핑된 agent user_id 수집(best-effort)
@@ -5903,6 +7173,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     acts = proc_json.get("activities") or []
                     process_role_agent_pairs: List[tuple[str, str]] = []
                     process_agent_skill_names: Dict[str, Set[str]] = {}
+                    process_agent_activity_texts: Dict[str, List[str]] = {}
+                    process_agent_roles: Dict[str, Set[str]] = {}
                     if isinstance(acts, list):
                         for a in acts:
                             if isinstance(a, dict):
@@ -5913,6 +7185,19 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                     agent_user_ids_for_skill_sync.add(aid)
                                     if role_name:
                                         process_role_agent_pairs.append((role_name, aid))
+                                        process_agent_roles.setdefault(aid, set()).add(role_name)
+                                    process_agent_activity_texts.setdefault(aid, []).append(
+                                        " ".join(
+                                            str(x or "")
+                                            for x in (
+                                                a.get("name"),
+                                                a.get("instruction"),
+                                                a.get("description"),
+                                                a.get("tool"),
+                                                role_name,
+                                            )
+                                        )
+                                    )
                                     # 생성된 스킬 중에서 activity와 연관성이 높은 것만 에이전트에 할당 후보로 누적
                                     if generated_skill_metas:
                                         ranked: List[tuple[float, str]] = []
@@ -5927,6 +7212,35 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                             top_skill_names = [n for _, n in ranked[:5]]
                                             agent_skill_names_for_sync.setdefault(aid, set()).update(top_skill_names)
                                             process_agent_skill_names.setdefault(aid, set()).update(top_skill_names)
+
+                    # 에이전트 프로필(역할/goal/persona/tools) 기반으로 스킬 매칭 보강
+                    users_by_id = {
+                        str(u.get("id")): u
+                        for u in (self._users or [])
+                        if isinstance(u, dict) and u.get("id")
+                    }
+                    for aid, texts in process_agent_activity_texts.items():
+                        profile = users_by_id.get(aid, {})
+                        activity_text = " ".join(texts[:20])
+                        role_hints = process_agent_roles.get(aid, set())
+                        scored: List[tuple[float, str]] = []
+                        for sm in generated_skill_metas:
+                            name = str(sm.get("name") or "").strip()
+                            if not name:
+                                continue
+                            score = self._match_skill_score_for_agent(
+                                agent_profile=profile,
+                                skill_meta=sm,
+                                activity_text=activity_text,
+                                role_hints=role_hints,
+                            )
+                            if score >= 0.22:
+                                scored.append((score, name))
+                        if scored:
+                            scored.sort(key=lambda x: x[0], reverse=True)
+                            top_agent_skills = [n for _, n in scored[:5]]
+                            agent_skill_names_for_sync.setdefault(aid, set()).update(top_agent_skills)
+                            process_agent_skill_names.setdefault(aid, set()).update(top_agent_skills)
 
                     # Neo4j 그래프에 Agent 노드/엣지 반영 (Task->Skill 직접 연결은 사용하지 않음)
                     await asyncio.to_thread(
@@ -5946,7 +7260,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     {
                         "process_id": proc_def_id, 
                         "process_name": process_name,
-                        "bpmn_xml": all_bpmn_xmls.get(proc_def_id, "")  # 이벤트에도 최종 XML 포함
+                        "bpmn_xml": all_bpmn_xmls.get(proc_def_id)  # XML 생성 비활성화: None
                     }
                 )
             

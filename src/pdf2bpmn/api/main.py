@@ -234,10 +234,6 @@ async def process_pdf_background(job_id: str):
             "dmn_decisions": [],
             "dmn_rules": [],
             "evidences": [],
-            "open_questions": [],
-            "resolved_questions": [],
-            "current_question": None,
-            "user_answer": None,
             "confidence_threshold": 0.8,
             "current_step": "ingest_pdf",
             "error": None,
@@ -545,7 +541,10 @@ async def get_process_graph(proc_id: str, include_integrated: bool = False):
     try:
         data = neo4j.get_process_graph_elements(proc_id)
         if not data:
-            raise HTTPException(404, "Process not found")
+            # Fallback: Process node may be missing/merged, but request snapshot can still exist.
+            data = neo4j.get_latest_request_process_graph_by_proc_id(proc_id)
+        if not data:
+            raise HTTPException(404, "Process graph not found")
         if include_integrated:
             data["integrated_graph"] = neo4j.get_latest_integrated_graph_by_proc_id(proc_id)
         return data

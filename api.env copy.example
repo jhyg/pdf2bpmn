@@ -12,6 +12,14 @@
 
 # OpenAI API (PDF 분석 및 엔티티 추출에 사용)
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_MODEL=gpt-4.1
+# OpenAI 호환 엔드포인트 (예: OpenRouter)
+# OPENAI_BASE_URL=https://openrouter.ai/api/v1
+
+# LLM 프록시(OpenAI 호환) - 설정 시 OPENAI_* 보다 우선 적용
+LLM_MODEL=openai/gpt-oss-120b
+LLM_PROXY_URL=http://ai-server.dream-flow.com:30000/v1
+LLM_PROXY_API_KEY=dream-flow
 
 # Neo4j 그래프 데이터베이스
 # Neo4j Desktop 또는 Docker로 실행 후 연결

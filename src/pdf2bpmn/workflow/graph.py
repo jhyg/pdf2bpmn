@@ -1,14 +1,12 @@
 """LangGraph workflow definition for PDF to BPMN conversion."""
 import re
-from typing import Literal
+import time
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 
 from ..models.state import GraphState
 from ..models.entities import (
     Process, Task, Role, Gateway, Event, 
-    Skill, DMNDecision, DMNRule, Evidence, Ambiguity,
-    AmbiguityStatus, generate_id
+    Skill, DMNDecision, DMNRule, Evidence
 )
 from ..extractors.pdf_extractor import PDFExtractor
 from ..extractors.entity_extractor import EntityExtractor
@@ -167,7 +165,7 @@ class PDF2BPMNWorkflow:
                 section.content,
                 existing_processes=existing_process_names,
                 existing_roles=existing_role_names,
-                existing_tasks=existing_tasks_info
+                existing_tasks=existing_tasks_info,
             )
             
             # Convert to entity objects with relationships
@@ -273,7 +271,7 @@ class PDF2BPMNWorkflow:
                 progress_callback(
                     i + 1, 
                     total_sections, 
-                    f"청크 {i+1}/{total_sections} LLM 분석 중: {section_preview}..."
+                    f"섹션 {i+1}/{total_sections} LLM 분석 중: {section_preview}..."
                 )
             
             # Find relevant chunk for this section
@@ -311,20 +309,32 @@ class PDF2BPMNWorkflow:
                 existing_tasks_info.append(task_info)
             
             try:
+                t_extract0 = time.perf_counter()
                 extracted = self.entity_extractor.extract_from_text(
                     section.content,
                     existing_processes=existing_process_names,
                     existing_roles=existing_role_names,
-                    existing_tasks=existing_tasks_info
+                    existing_tasks=existing_tasks_info,
                 )
+                t_extract_ms = int((time.perf_counter() - t_extract0) * 1000)
                 
                 # Convert to entity objects
+                t_convert0 = time.perf_counter()
                 entities = self.entity_extractor.convert_to_entities(
                     extracted, 
                     section_doc_id,
                     chunk_id=section_chunk_id,
                     existing_processes=(doc_process_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.process_name_to_id),
                     existing_roles=(doc_role_name_to_id.get(section_doc_id, {}) if is_multi_doc else self.role_name_to_id)
+                )
+                t_convert_ms = int((time.perf_counter() - t_convert0) * 1000)
+                print(
+                    f"   ⏱️ [SECTION-TIMING] {i+1}/{total_sections} "
+                    f"extract={t_extract_ms}ms convert={t_convert_ms}ms "
+                    f"text_len={len(section.content or '')} "
+                    f"entities(tasks={len(entities.get('tasks') or [])}, roles={len(entities.get('roles') or [])}, "
+                    f"gateways={len(entities.get('gateways') or [])}, flows={len(entities.get('sequence_flows') or [])}, "
+                    f"decisions={len(entities.get('decisions') or [])}, rules={len(entities.get('rules') or [])})"
                 )
                 
                 # Collect entities
@@ -489,7 +499,7 @@ class PDF2BPMNWorkflow:
             "roles": unique_roles,
             "skills": unique_skills,
             "dmn_decisions": unique_decisions,
-            "current_step": "detect_ambiguities"
+            "current_step": "generate_skills"
         }
     
     def _create_sequence_flows(self, tasks: list, processes: list):
@@ -1169,104 +1179,7 @@ class PDF2BPMNWorkflow:
             unique.append(entity)
         
         return unique
-    
-    def detect_ambiguities(self, state: GraphState) -> GraphState:
-        """Node: Detect ambiguities that need human resolution."""
-        print("❓ Detecting ambiguities...")
-        
-        questions = []
-        
-        tasks = state.get("tasks", [])
-        roles = state.get("roles", [])
-        processes = state.get("processes", [])
-        gateways = state.get("gateways", [])
-        
-        # Count tasks without roles
-        tasks_without_roles = [t for t in tasks if t.task_id not in self.task_role_map]
-        
-        if tasks_without_roles and roles:
-            # Create batch question for role assignment
-            role_names = [r.name for r in roles]
-            for task in tasks_without_roles[:10]:  # Limit to 10 questions
-                questions.append(Ambiguity(
-                    amb_id=generate_id(),
-                    entity_type="Task",
-                    entity_id=task.task_id,
-                    question=f"'{task.name}' 태스크의 담당 역할은 누구인가요?",
-                    options=role_names + ["새 역할 추가", "미정"],
-                    status=AmbiguityStatus.OPEN
-                ))
-        
-        # Store ambiguities in Neo4j
-        for q in questions:
-            self.neo4j.create_ambiguity(q)
-        
-        print(f"   {len(questions)} questions generated")
-        print(f"   Tasks without roles: {len(tasks_without_roles)}")
-        
-        return {
-            "open_questions": questions,
-            "current_step": "ask_user" if questions else "generate_skills"
-        }
-    
-    def ask_user(self, state: GraphState) -> GraphState:
-        """Node: Wait for user input on ambiguities (HITL interrupt point)."""
-        print("🙋 Waiting for user input...")
-        
-        questions = state.get("open_questions", [])
-        open_questions = [q for q in questions if q.status == AmbiguityStatus.OPEN]
-        
-        if open_questions:
-            current = open_questions[0]
-            return {
-                "current_question": current,
-                "current_step": "waiting_for_user"
-            }
-        
-        return {
-            "current_question": None,
-            "current_step": "generate_skills"
-        }
-    
-    def apply_user_answer(self, state: GraphState) -> GraphState:
-        """Node: Apply user's answer to resolve ambiguity."""
-        print("✅ Applying user answer...")
-        
-        current_question = state.get("current_question")
-        user_answer = state.get("user_answer")
-        
-        if current_question and user_answer:
-            current_question.status = AmbiguityStatus.RESOLVED
-            current_question.answer = user_answer
-            
-            self.neo4j.resolve_ambiguity(current_question.amb_id, user_answer)
-            
-            # Apply answer - link task to selected role
-            if current_question.entity_type == "Task":
-                role_name = user_answer.lower()
-                if role_name in self.role_name_to_id:
-                    role_id = self.role_name_to_id[role_name]
-                    self.neo4j.link_task_to_role(current_question.entity_id, role_id)
-                    self.task_role_map[current_question.entity_id] = role_id
-            
-            resolved = state.get("resolved_questions", [])
-            resolved.append(current_question)
-            
-            open_questions = [
-                q for q in state.get("open_questions", [])
-                if q.amb_id != current_question.amb_id
-            ]
-            
-            return {
-                "resolved_questions": resolved,
-                "open_questions": open_questions,
-                "current_question": None,
-                "user_answer": None,
-                "current_step": "detect_ambiguities"
-            }
-        
-        return {"current_step": "generate_skills"}
-    
+
     def generate_skills(self, state: GraphState) -> GraphState:
         """Node: Generate skill documents from extracted ontology skills."""
         print("📝 Generating skill documents...")
@@ -1509,26 +1422,6 @@ class PDF2BPMNWorkflow:
         }
 
 
-def should_ask_user(state: GraphState) -> Literal["ask_user", "generate_skills"]:
-    """Routing function: determine if we need user input."""
-    open_questions = state.get("open_questions", [])
-    unresolved = [q for q in open_questions if q.status == AmbiguityStatus.OPEN]
-    
-    if unresolved:
-        return "ask_user"
-    return "generate_skills"
-
-
-def has_more_questions(state: GraphState) -> Literal["ask_user", "generate_skills"]:
-    """Check if there are more questions to ask."""
-    open_questions = state.get("open_questions", [])
-    unresolved = [q for q in open_questions if q.status == AmbiguityStatus.OPEN]
-    
-    if unresolved:
-        return "ask_user"
-    return "generate_skills"
-
-
 def create_workflow() -> StateGraph:
     """Create the LangGraph workflow."""
     
@@ -1540,9 +1433,6 @@ def create_workflow() -> StateGraph:
     workflow.add_node("segment_sections", workflow_handler.segment_sections)
     workflow.add_node("extract_candidates", workflow_handler.extract_candidates)
     workflow.add_node("normalize_entities", workflow_handler.normalize_entities)
-    workflow.add_node("detect_ambiguities", workflow_handler.detect_ambiguities)
-    workflow.add_node("ask_user", workflow_handler.ask_user)
-    workflow.add_node("apply_user_answer", workflow_handler.apply_user_answer)
     workflow.add_node("generate_skills", workflow_handler.generate_skills)
     workflow.add_node("generate_dmn", workflow_handler.generate_dmn)
     workflow.add_node("assemble_bpmn", workflow_handler.assemble_bpmn)
@@ -1554,28 +1444,7 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("ingest_pdf", "segment_sections")
     workflow.add_edge("segment_sections", "extract_candidates")
     workflow.add_edge("extract_candidates", "normalize_entities")
-    workflow.add_edge("normalize_entities", "detect_ambiguities")
-    
-    workflow.add_conditional_edges(
-        "detect_ambiguities",
-        should_ask_user,
-        {
-            "ask_user": "ask_user",
-            "generate_skills": "generate_skills"
-        }
-    )
-    
-    workflow.add_edge("ask_user", "apply_user_answer")
-    
-    workflow.add_conditional_edges(
-        "apply_user_answer",
-        has_more_questions,
-        {
-            "ask_user": "ask_user",
-            "generate_skills": "generate_skills"
-        }
-    )
-    
+    workflow.add_edge("normalize_entities", "generate_skills")
     workflow.add_edge("generate_skills", "generate_dmn")
     workflow.add_edge("generate_dmn", "assemble_bpmn")
     workflow.add_edge("assemble_bpmn", "validate_consistency")
@@ -1586,7 +1455,6 @@ def create_workflow() -> StateGraph:
 
 
 def compile_workflow_with_checkpointer():
-    """Compile workflow with memory checkpointer for HITL support."""
+    """Compile workflow."""
     workflow = create_workflow()
-    checkpointer = MemorySaver()
-    return workflow.compile(checkpointer=checkpointer)
+    return workflow.compile()

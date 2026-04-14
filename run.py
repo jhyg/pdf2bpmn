@@ -8,7 +8,7 @@ from src.pdf2bpmn.workflow.graph import PDF2BPMNWorkflow
 from src.pdf2bpmn.config import Config
 
 
-def run_cli(pdf_paths: list[str], skip_hitl: bool = False):
+def run_cli(pdf_paths: list[str]):
     """Run the PDF to BPMN conversion from CLI."""
     print("=" * 60)
     print("🚀 PDF2BPMN Converter")
@@ -48,10 +48,6 @@ def run_cli(pdf_paths: list[str], skip_hitl: bool = False):
         "dmn_decisions": [],
         "dmn_rules": [],
         "evidences": [],
-        "open_questions": [],
-        "resolved_questions": [],
-        "current_question": None,
-        "user_answer": None,
         "confidence_threshold": Config.CONFIDENCE_THRESHOLD,
         "current_step": "ingest_pdf",
         "error": None,
@@ -76,21 +72,6 @@ def run_cli(pdf_paths: list[str], skip_hitl: bool = False):
         
         result = workflow.normalize_entities(state)
         state.update(result)
-        
-        result = workflow.detect_ambiguities(state)
-        state.update(result)
-        
-        # Handle HITL questions
-        open_questions = state.get("open_questions", [])
-        if open_questions and not skip_hitl:
-            print(f"\n❓ {len(open_questions)}개의 확인이 필요한 항목이 있습니다.")
-            print("   (--skip-hitl 옵션으로 건너뛸 수 있습니다)\n")
-            
-            for i, q in enumerate(open_questions[:5], 1):  # Show first 5
-                print(f"   {i}. {q.question}")
-            
-            if len(open_questions) > 5:
-                print(f"   ... 외 {len(open_questions) - 5}개")
         
         # Continue with generation
         result = workflow.generate_skills(state)
@@ -159,11 +140,6 @@ def main():
         nargs="+",
         help="변환할 PDF 파일 경로"
     )
-    convert_parser.add_argument(
-        "--skip-hitl",
-        action="store_true",
-        help="Human-in-the-loop 질문 건너뛰기"
-    )
     
     # UI command (Streamlit)
     ui_parser = subparsers.add_parser("ui", help="Streamlit UI 실행")
@@ -179,7 +155,7 @@ def main():
     args = parser.parse_args()
     
     if args.command == "convert":
-        sys.exit(run_cli(args.files, args.skip_hitl))
+        sys.exit(run_cli(args.files))
     elif args.command == "ui":
         run_streamlit()
     elif args.command == "api":
